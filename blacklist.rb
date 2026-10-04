@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require_relative 'logger'
+
 # Parses and evaluates e621-style blacklist rules.
 #
 # Each non-blank, non-comment line is a rule.  Tags on the same line are AND'd
@@ -14,6 +16,8 @@
 #   id:12345              → blacklist a specific post
 #
 class Blacklist
+  include Rubichiver::Logging
+
   Rule = Struct.new(:required, :optional_or, :forbidden)
 
   def initialize(file)

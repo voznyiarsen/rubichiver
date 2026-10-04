@@ -3,5 +3,7 @@
 source 'https://rubygems.org'
 
 # rubichiver - Unified booru media archiver
-# Uses Ruby stdlib; zero runtime dependencies.
-# Minitest is used for testing (stdlib in Ruby 3.x).
+#
+# sqlite3 backs the archive database. Everything else is Ruby stdlib; Minitest is
+# used for testing (stdlib in Ruby 3.x).
+gem 'sqlite3', '~> 2.0'

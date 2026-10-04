@@ -5,6 +5,7 @@ gelbooru-api-credentials.txt
 # User data
 tags.txt
 blacklist.txt
+config/
 
 # Output directories
 e621-archive/
@@ -12,6 +13,12 @@ gelbooru-archive/
 
 # Cache
 cache/
+
+# Archive database
+*.db
+*.db-wal
+*.db-shm
+*.db.corrupt-*
 
 # Temp / testing
 temporary/

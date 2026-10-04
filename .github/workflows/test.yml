@@ -1,0 +1,33 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ['3.1', '3.2', '3.3', '3.4']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Ruby ${{ matrix.ruby }}
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+
+      # sqlite3 backs the archive database; minitest and rake are the harness.
+      # Installed explicitly rather than via bundler so CI does not depend on
+      # minitest being a bundled gem in every Ruby build.
+      - name: Install dependencies
+        run: gem install sqlite3 minitest rake --no-document
+
+      - name: Install exiftool
+        run: sudo apt-get update && sudo apt-get install -y exiftool
+
+      - name: Run tests
+        run: rake test

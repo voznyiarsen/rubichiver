@@ -132,14 +132,19 @@ module Rubichiver
 
     configure
   end
-end
 
-def logger
-  Rubichiver::Logger
-end
+  # Instance-level access to the logger. Mixed into the classes that emit
+  # records so the helpers are not added to Object, where they would be
+  # reachable from every object in the process.
+  module Logging
+    def logger
+      Rubichiver::Logger
+    end
 
-def log_debug(msg, ctx = {})  logger.debug(msg, ctx)  end
-def log_info(msg, ctx = {})   logger.info(msg, ctx)   end
-def log_warn(msg, ctx = {})   logger.warn(msg, ctx)   end
-def log_error(msg, ctx = {})  logger.error(msg, ctx)  end
-def log_fatal(msg, ctx = {})  logger.fatal(msg, ctx)  end
+    def log_debug(msg, ctx = {}) logger.debug(msg, ctx) end
+    def log_info(msg, ctx = {})  logger.info(msg, ctx)  end
+    def log_warn(msg, ctx = {})  logger.warn(msg, ctx)  end
+    def log_error(msg, ctx = {}) logger.error(msg, ctx) end
+    def log_fatal(msg, ctx = {}) logger.fatal(msg, ctx) end
+  end
+end

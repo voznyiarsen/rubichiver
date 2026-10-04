@@ -5,6 +5,7 @@ require_relative 'test_helper'
 class PostProcessorUnitTest < Minitest::Test
   def setup
     @dir = Dir.mktmpdir
+    FileUtils.mkdir_p(File.join(@dir, 'posts'))
     @stats = Stats.new
   end
 
@@ -12,12 +13,17 @@ class PostProcessorUnitTest < Minitest::Test
     FileUtils.remove_entry(@dir)
   end
 
-  class TestArchiver
-    attr_accessor :interrupted, :existing_posts
+  # A real archiver with the network-facing pieces stubbed, so the location
+  # and bookkeeping machinery is exercised rather than re-implemented here.
+  class TestArchiver < Archiver
+    attr_reader :downloaded
 
-    def initialize
-      @interrupted = false
-      @existing_posts = {}
+    def site_name
+      'test'
+    end
+
+    def default_output_dir
+      @output_dir
     end
 
     def post_file_url(post)
@@ -35,36 +41,55 @@ class PostProcessorUnitTest < Minitest::Test
 
     def resolve_served_extension(post, orig_ext, file_url)
       url_ext = File.extname(URI.parse(file_url || '').path).delete('.').downcase rescue ''
-      if url_ext && !url_ext.empty? && url_ext != 'unknown'
-        url_ext
-      else
-        orig_ext
-      end
+      url_ext.empty? ? orig_ext : url_ext
     end
 
-    def sidecar_valid?(post)
+    def extract_post_tags(post)
+      (post['tags'] || '').to_s.split
+    end
+
+    def rating_value(_rating)
+      '1'
+    end
+
+    def rating_label(_post)
+      'safe'
+    end
+
+    def sidecar_valid?(_post, _location = nil)
       true
     end
 
-    def download_media(url, output_file, post_id, md5, thread_idx: nil)
+    def download_media(_url, output_file, _post_id, _md5, thread_idx: nil)
+      @downloaded << output_file
       File.write(output_file, 'fake')
       true
     end
 
-    def write_sidecar(media_file, post)
+    def write_sidecar(_media_file, _post)
       true
     end
   end
 
-  def test_output_file_uses_served_extension
-    archiver = TestArchiver.new
-    pp = PostProcessor.new(
+  def build_archiver(dir)
+    archiver = TestArchiver.new(output_dir: dir, username: 'tester', api_key: 'key', rate_limit: 1000)
+    archiver.instance_variable_set(:@downloaded, [])
+    archiver
+  end
+
+  def processor(archiver, stats)
+    PostProcessor.new(
       rate_limiter: RateLimiter.new(requests_per_second: 1000),
-      output_dir: @dir,
-      stats: @stats,
+      output_dir: archiver.output_dir,
+      stats: stats,
       thread_count: 0,
       archiver: archiver
     )
+  end
+
+  def test_output_file_uses_served_extension
+    archiver = build_archiver(@dir)
+    pp = processor(archiver, @stats)
     post = {
       'id' => 42,
       'image' => 'orig.webm',
@@ -74,21 +99,14 @@ class PostProcessorUnitTest < Minitest::Test
       'rating' => 'safe'
     }
 
-    archiver.existing_posts = {}
     pp.send(:process_post, post, 0)
 
-    assert File.exist?(File.join(@dir, '42.mp4'))
+    assert File.exist?(File.join(@dir, 'posts', '42.mp4'))
   end
 
   def test_output_file_falls_back_to_original_extension
-    archiver = TestArchiver.new
-    pp = PostProcessor.new(
-      rate_limiter: RateLimiter.new(requests_per_second: 1000),
-      output_dir: @dir,
-      stats: @stats,
-      thread_count: 0,
-      archiver: archiver
-    )
+    archiver = build_archiver(@dir)
+    pp = processor(archiver, @stats)
     post = {
       'id' => 7,
       'image' => 'orig.png',
@@ -98,21 +116,14 @@ class PostProcessorUnitTest < Minitest::Test
       'rating' => 'safe'
     }
 
-    archiver.existing_posts = {}
     pp.send(:process_post, post, 0)
 
-    assert File.exist?(File.join(@dir, '7.png'))
+    assert File.exist?(File.join(@dir, 'posts', '7.png'))
   end
 
   def test_unsupported_extension_skips_download
-    archiver = TestArchiver.new
-    pp = PostProcessor.new(
-      rate_limiter: RateLimiter.new(requests_per_second: 1000),
-      output_dir: @dir,
-      stats: @stats,
-      thread_count: 0,
-      archiver: archiver
-    )
+    archiver = build_archiver(@dir)
+    pp = processor(archiver, @stats)
     post = {
       'id' => 9,
       'image' => 'orig.swf',
@@ -122,10 +133,9 @@ class PostProcessorUnitTest < Minitest::Test
       'rating' => 'safe'
     }
 
-    archiver.existing_posts = {}
     pp.send(:process_post, post, 0)
 
-    refute File.exist?(File.join(@dir, '9.swf'))
+    refute File.exist?(File.join(@dir, 'posts', '9.swf'))
     assert_equal 1, @stats.skipped_files
   end
 
@@ -139,21 +149,16 @@ class PostProcessorUnitTest < Minitest::Test
       'rating' => 'safe'
     }
 
-    File.write(File.join(@dir, '55.jpeg'), 'x')
+    File.write(File.join(@dir, 'posts', '55.jpeg'), 'x')
 
-    archiver = TestArchiver.new
-    archiver.existing_posts = { 55 => File.join(@dir, '55.jpeg') }
+    archiver = build_archiver(@dir)
+    archiver.scan_output_dir
+    pp = processor(archiver, @stats)
 
-    pp = PostProcessor.new(
-      rate_limiter: RateLimiter.new(requests_per_second: 1000),
-      output_dir: @dir,
-      stats: @stats,
-      thread_count: 0,
-      archiver: archiver
-    )
     pp.send(:process_post, post, 0)
 
     assert_equal 1, @stats.skipped_files
+    assert_empty archiver.downloaded
   end
 
   def test_existing_file_with_invalid_sidecar_regenerates
@@ -166,30 +171,39 @@ class PostProcessorUnitTest < Minitest::Test
       'rating' => 'safe'
     }
 
-    File.write(File.join(@dir, '56.jpeg'), 'x')
+    File.write(File.join(@dir, 'posts', '56.jpeg'), 'x')
 
-    archiver = TestArchiver.new
-    def archiver.sidecar_valid?(post)
+    archiver = build_archiver(@dir)
+    def archiver.sidecar_valid?(_post, _location = nil)
       false
     end
-    archiver.existing_posts = { 56 => File.join(@dir, '56.jpeg') }
+    archiver.scan_output_dir
+    pp = processor(archiver, @stats)
 
-    pp = PostProcessor.new(
-      rate_limiter: RateLimiter.new(requests_per_second: 1000),
-      output_dir: @dir,
-      stats: @stats,
-      thread_count: 0,
-      archiver: archiver
-    )
     pp.send(:process_post, post, 0)
 
     assert_equal 1, @stats.autotagged_files
+  end
+
+  # Pool bundling can queue the same post more than once; it must be placed
+  # once per location or two workers would write the same .part file.
+  def test_a_post_is_placed_once_per_location
+    post = { 'id' => 60, 'image' => '60.png', 'file_url' => 'https://x/60.png', 'md5' => 'z',
+             'tags' => 'cat', 'rating' => 'safe' }
+    archiver = build_archiver(@dir)
+    pp = processor(archiver, @stats)
+
+    3.times { pp.send(:process_post, post, 0) }
+
+    assert_equal 1, archiver.downloaded.size
+    assert_equal 1, @stats.downloaded_files
   end
 end
 
 class E621PostProcessorTest < Minitest::Test
   def setup
     @dir = Dir.mktmpdir
+    FileUtils.mkdir_p(File.join(@dir, 'posts'))
     @stats = Stats.new
   end
 
@@ -239,13 +253,14 @@ class E621PostProcessorTest < Minitest::Test
     pp.send(:process_post, post, 0)
 
     assert_equal 1, @stats.downloaded_files
-    assert File.exist?(File.join(@dir, '100.jpg'))
+    assert File.exist?(File.join(@dir, 'posts', '100.jpg'))
   end
 end
 
 class GelbooruPostProcessorTest < Minitest::Test
   def setup
     @dir = Dir.mktmpdir
+    FileUtils.mkdir_p(File.join(@dir, 'posts'))
     @stats = Stats.new
   end
 
@@ -294,7 +309,7 @@ class GelbooruPostProcessorTest < Minitest::Test
     pp.send(:process_post, post, 0)
 
     assert_equal 1, @stats.downloaded_files
-    assert File.exist?(File.join(@dir, '200.png'))
+    assert File.exist?(File.join(@dir, 'posts', '200.png'))
   end
 
   def test_categorize_tags

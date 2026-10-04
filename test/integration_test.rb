@@ -1,6 +1,294 @@
 # frozen_string_literal: true
 
 require_relative 'test_helper'
+require_relative 'support/stub_http'
+
+# Drives the whole run loop — lock, output scan, sidecar index, worker pool,
+# downloads, sidecars and the summary — against a stubbed transport.
+class FullRunTest < Minitest::Test
+  include StubHttp
+
+  PNG = Base64.decode64(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
+  )
+
+  def setup
+    @dir = Dir.mktmpdir
+    @tags_file = File.join(@dir, 'tags.txt')
+    File.write(@tags_file, "# queries\nsolo\n")
+    @archiver = build_archiver
+  end
+
+  def teardown
+    FileUtils.remove_entry(@dir)
+  end
+
+  def build_archiver
+    E621Archiver.new(
+      output_dir: @dir,
+      cache_dir: File.join(@dir, 'cache'),
+      tags_file: @tags_file,
+      credentials_file: File.join(@dir, 'credentials.txt'),
+      blacklist_file: File.join(@dir, 'blacklist.txt'),
+      username: 'tester',
+      api_key: 'key',
+      rate_limit: 1000
+    )
+  end
+
+  def post(id)
+    {
+      'id' => id,
+      'rating' => 's',
+      'tags' => { 'general' => ['cat'], 'artist' => ['bob'] },
+      'files' => {
+        'original' => { 'url' => "https://cdn.e621.net/data/#{id}.png" },
+        'meta' => { 'ext' => 'png', 'md5' => Digest::MD5.hexdigest(PNG) }
+      }
+    }
+  end
+
+  def stub_transport(ids: [4242])
+    stub_http_get(@archiver) do |uri, _n|
+      if uri.host == 'e621.net'
+        StubHttp::Response.new(200, JSON.generate(ids.map { |id| post(id) }))
+      else
+        StubHttp::Response.new(200, PNG)
+      end
+    end
+  end
+
+  # The lock is released when the process exits, so close it by hand between
+  # in-process runs.
+  def release_lock
+    lock = @archiver.instance_variable_get(:@lock_file)
+    lock&.close
+  end
+
+  def run_archiver(archiver = @archiver)
+    error = assert_raises(SystemExit) { archiver.run }
+    error.status
+  end
+
+  def test_run_downloads_writes_sidecars_and_reports_success
+    stub_transport
+
+    assert_equal 0, run_archiver
+    assert File.exist?(File.join(@dir, 'posts', '4242.png'))
+    assert File.exist?(File.join(@dir, 'posts', '4242.xmp'))
+    posts_children = Dir.exist?(File.join(@dir, 'posts')) ? Dir.children(File.join(@dir, 'posts')) : []
+    assert_empty posts_children.select { |name| name.end_with?('.part') }
+  end
+
+  def test_second_run_skips_posts_whose_sidecar_is_current
+    stub_transport
+    assert_equal 0, run_archiver
+    release_lock
+
+    @archiver = build_archiver
+    stub_transport
+
+    assert_equal 0, run_archiver
+    assert_equal 1, @archiver.existing_posts.size
+  end
+
+  def test_missing_sidecar_is_regenerated_without_redownloading
+    stub_transport
+    assert_equal 0, run_archiver
+    release_lock
+    File.delete(File.join(@dir, 'posts', '4242.xmp'))
+    downloaded = File.read(File.join(@dir, 'posts', '4242.png'))
+
+    @archiver = build_archiver
+    calls = stub_transport
+
+    assert_equal 0, run_archiver
+    assert_equal downloaded, File.read(File.join(@dir, 'posts', '4242.png'))
+    assert File.exist?(File.join(@dir, 'posts', '4242.xmp'))
+    refute calls.any? { |call| call[:uri].host == 'cdn.e621.net' }, 'should not download again'
+  end
+
+  def test_dry_run_writes_nothing
+    dry = build_archiver
+    dry.instance_variable_set(:@dry_run, true)
+    stub_http_get(dry) do |uri, _n|
+      if uri.host == 'e621.net'
+        StubHttp::Response.new(200, JSON.generate([post(4242)]))
+      else
+        StubHttp::Response.new(200, PNG)
+      end
+    end
+
+    assert_equal 0, run_archiver(dry)
+    refute File.exist?(File.join(@dir, 'posts', '4242.png'))
+    refute File.exist?(File.join(@dir, 'cache'))
+  end
+end
+
+# End to end: a post found by a tag query drags its whole pool in, and the
+# bundle directory holds every member with its own sidecar.
+class PoolBundleRunTest < Minitest::Test
+  include StubHttp
+
+  PNG = Base64.decode64(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
+  )
+  POOL_ID = 56_729
+  POOL_IDS = [6_403_790, 6_403_810, 6_476_912].freeze
+
+  def setup
+    @dir = Dir.mktmpdir
+    @tags_file = File.join(@dir, 'tags.txt')
+    File.write(@tags_file, "solo\n")
+  end
+
+  def teardown
+    FileUtils.remove_entry(@dir)
+  end
+
+  def post(id, pools: [])
+    {
+      'id' => id, 'rating' => 's', 'pools' => pools,
+      'tags' => { 'general' => ['cat'] },
+      'files' => {
+        'original' => { 'url' => "https://cdn.e621.net/data/#{id}.png" },
+        'meta' => { 'ext' => 'png', 'md5' => Digest::MD5.hexdigest(PNG) }
+      }
+    }
+  end
+
+  def build_archiver
+    E621Archiver.new(
+      output_dir: @dir,
+      cache_dir: File.join(@dir, 'cache'),
+      tags_file: @tags_file,
+      credentials_file: File.join(@dir, 'credentials.txt'),
+      username: 'tester', api_key: 'key', rate_limit: 1000
+    )
+  end
+
+  # Search returns one post that belongs to a pool; the pool lookup and the
+  # id-batched member lookups are served from the same stub.
+  def stub_transport
+    stub_http_get(@archiver) do |uri, _n|
+      if uri.host == 'cdn.e621.net'
+        StubHttp::Response.new(200, PNG)
+      elsif uri.path.start_with?('/pools/')
+        StubHttp::Response.new(200, JSON.generate(
+                                           'id' => POOL_ID, 'name' => 'They_Said_[SaturnSamo]',
+                                           'post_ids' => POOL_IDS, 'post_count' => POOL_IDS.size,
+                                           'is_active' => true
+                                         ))
+      else
+        query = query_params(uri)['tags']
+        # Only the tag query matches "solo"; id lookups return the members.
+        ids = query.start_with?('id:') ? query.sub('id:', '').split(',').map(&:to_i) : [6_476_912]
+        body = ids.map { |id| post(id, pools: id == 6_476_912 ? [POOL_ID] : []) }
+        StubHttp::Response.new(200, JSON.generate(body))
+      end
+    end
+  end
+
+  def run_archiver(archiver = @archiver)
+    error = assert_raises(SystemExit) { archiver.run }
+    error.status
+  end
+
+  def bundle_dir
+    File.join(@dir, 'pools', '56729_they-said-saturnsamo')
+  end
+
+  def test_a_found_post_pulls_its_whole_pool_into_one_directory
+    @archiver = build_archiver
+    stub_transport
+
+    assert_equal 0, run_archiver
+
+    POOL_IDS.each do |id|
+      assert File.exist?(File.join(bundle_dir, "#{id}.png")), "missing #{id}.png in the bundle"
+      assert File.exist?(File.join(bundle_dir, "#{id}.xmp")), "missing #{id}.xmp in the bundle"
+    end
+    refute File.exist?(File.join(@dir, 'posts', '6403790.png')), 'members should live in the bundle, not in posts/'
+  end
+
+  def test_the_run_report_counts_pools_and_records_the_bundle
+    @archiver = build_archiver
+    stub_transport
+    run_archiver
+
+    report = @archiver.build_report(Stats.new, 1.0)
+    assert_equal 1, report[:pools_expanded]
+    assert_equal 1, @archiver.pools_expanded_count
+
+    assert_equal 3, @archiver.db.pool_member_ids(POOL_ID).size
+    assert_equal 'they-said-saturnsamo', @archiver.db.pool(POOL_ID)['slug']
+    assert_equal POOL_IDS.sort, @archiver.db.files.map { |f| f['post'] }.sort
+    assert(@archiver.db.files.all? { |f| f['sidecar'] == 1 })
+  end
+
+  # A second visit must not refetch anything: the bundle is already complete.
+  def test_a_second_run_downloads_nothing_more
+    @archiver = build_archiver
+    stub_transport
+    assert_equal 0, run_archiver
+    lock = @archiver.instance_variable_get(:@lock_file)
+    lock&.close
+
+    @archiver = build_archiver
+    calls = stub_transport
+    assert_equal 0, run_archiver
+
+    assert_empty calls.select { |call| call[:uri].host == 'cdn.e621.net' }
+  end
+
+  # One member already archived in posts/ is linked into the bundle rather
+  # than fetched a second time.
+  def test_a_post_already_archived_elsewhere_is_placed_not_downloaded
+    root_copy = File.join(@dir, 'posts', '6403790.png')
+    FileUtils.mkdir_p(File.dirname(root_copy))
+    File.write(root_copy, PNG)
+    @archiver = build_archiver
+    calls = stub_transport
+
+    assert_equal 0, run_archiver
+
+    bundle_copy = File.join(bundle_dir, '6403790.png')
+    assert File.exist?(bundle_copy)
+    assert_equal File.stat(root_copy).ino, File.stat(bundle_copy).ino, 'should be a link, not a second copy'
+    assert_empty calls.select { |call| call[:uri].path == '/data/6403790.png' }
+    assert_equal 2, @archiver.db.files.count { |f| f['post'] == 6_403_790 }, 'both locations are recorded'
+  end
+
+  def test_pool_bundling_can_be_switched_off
+    FileUtils.mkdir_p(File.join(@dir, 'posts'))
+    File.write(File.join(@dir, 'posts', '6403790.png'), PNG)
+    @archiver = build_archiver
+    @archiver.pools_enabled = false
+    calls = stub_transport
+
+    assert_equal 0, run_archiver
+
+    assert_empty calls.select { |call| call[:uri].path.start_with?('/pools/') }
+    assert File.exist?(File.join(@dir, 'posts', '6476912.png')), 'without bundling the post is archived in posts/'
+  end
+
+  def test_a_deleted_member_file_is_downloaded_again
+    @archiver = build_archiver
+    stub_transport
+    run_archiver
+    lock = @archiver.instance_variable_get(:@lock_file)
+    lock&.close
+    File.delete(File.join(bundle_dir, '6403810.png'))
+    File.delete(File.join(bundle_dir, '6403810.xmp'))
+
+    @archiver = build_archiver
+    calls = stub_transport
+    assert_equal 0, run_archiver
+
+    assert File.exist?(File.join(bundle_dir, '6403810.png'))
+    assert_equal 1, calls.count { |call| call[:uri].path == '/data/6403810.png' }
+  end
+end
 
 class E621FetchIntegrationTest < Minitest::Test
   def setup

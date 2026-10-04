@@ -6,136 +6,179 @@
 # Supports e621.net and Gelbooru via --site flag.
 
 require 'optparse'
+require_relative 'version'
 require_relative 'logger'
 require_relative 'rate_limiter'
 require_relative 'post_processor'
 require_relative 'blacklist'
+require_relative 'archive_db'
 require_relative 'archiver_base'
 require_relative 'archiver_e621'
 require_relative 'archiver_gelbooru'
 
 if __FILE__ == $PROGRAM_NAME
-  site = nil
-  remaining = []
-  iter = ARGV.each
-  begin
-    loop do
-      arg = iter.next
-      case arg
-      when '-s', '--site'
-        site = iter.next
-      when /\A--site=(.+)\z/
-        site = $1
-      else
-        remaining << arg
-      end
-    end
-  rescue StopIteration
-  end
-
-  unless site
-    puts "Usage: ruby rubichiver.rb --site e621|gelbooru [OPTIONS]"
-    puts ""
-    puts "  -s, --site SITE              Target site (e621 or gelbooru)"
-    puts "  -o, --output DIR             Output directory"
-    puts "  -t, --tags FILE              Tags file (default: ./tags.txt)"
-    puts "  -c, --credentials FILE       API credentials file"
-    puts "      --dry-run                Preview posts that would be archived"
-    puts "  -v, --verbose                Verbose output"
-    puts "      --json                   JSON log output (machine-parseable)"
-    puts "  -j, --threads N              Number of worker threads (default: 2)"
-    puts "      --rate-limit N           API requests per second (default: 1)"
-    puts "  -b, --blacklist FILE         Blacklist file (e621 syntax, default: ./blacklist.txt)"
-    puts "      --notify URL             POST a JSON run report to URL on completion"
-    puts "      --recache-post-tags      Refresh local tag cache for all existing posts from API"
-    puts "  -C, --cache-dir DIR          Cache directory for API responses (default: $output_dir/cache)"
-    puts "  -h, --help                   Show this help message"
-    exit 0
-  end
-
-  unless %w[e621 gelbooru].include?(site)
-    puts "Error: --site must be 'e621' or 'gelbooru', got '#{site}'"
-    exit 1
-  end
+  sites = {
+    'e621' => { archiver: E621Archiver, credentials: './e621-api-credentials.txt' },
+    'gelbooru' => { archiver: GelbooruArchiver, credentials: './gelbooru-api-credentials.txt' }
+  }
 
   options = {
+    site: nil,
     output: nil,
     tags: './tags.txt',
     credentials: nil,
     blacklist: './blacklist.txt',
+    cache_dir: nil,
+    db_path: nil,
     dry_run: false,
+    recache_post_tags: false,
+    pools: true,
+    repair_missing: true,
+    verify_md5: false,
+    notify: nil,
+    threads: 2,
+    rate_limit: Archiver::DEFAULT_REQUESTS_PER_SECOND,
     verbose: false,
     json: false,
-    threads: 2,
-    rate_limit: 1
+    cache_max_age: Archiver::CACHE_MAX_AGE_DAYS
   }
 
   parser = OptionParser.new do |opts|
-    opts.banner = "Usage: ruby rubichiver.rb --site #{site} [OPTIONS]"
+    opts.banner = "Usage: ruby #{File.basename($PROGRAM_NAME)} --site SITE [OPTIONS]"
+    opts.separator ''
 
-    opts.separator ""
-    opts.separator "Options for #{site}:"
+    opts.separator 'Site:'
+    opts.on('-s', '--site SITE', "Target site: #{sites.keys.join(' or ')}") do |value|
+      options[:site] = value
+    end
 
-    opts.on('-o', '--output DIR', 'Output directory') { |v| options[:output] = v }
-    opts.on('-t', '--tags FILE', 'Tags file (default: ./tags.txt)') { |v| options[:tags] = v }
-    opts.on('-c', '--credentials FILE', "API credentials file (default: ./e621-api-credentials.txt for e621, ./gelbooru-api-credentials.txt for gelbooru)") { |v| options[:credentials] = v }
-    opts.on('--dry-run', 'Preview posts that would be archived') { options[:dry_run] = true }
+    opts.separator ''
+    opts.separator 'Input and output:'
+    opts.on('-o', '--output DIR', 'Output directory') { |value| options[:output] = value }
+    opts.on('-t', '--tags FILE', 'Tag query file (default: ./tags.txt)') { |value| options[:tags] = value }
+    opts.on('-b', '--blacklist FILE', 'Blacklist file, e621 syntax (default: ./blacklist.txt)') do |value|
+      options[:blacklist] = value
+    end
+    opts.on('-C', '--cache-dir DIR', 'Cache directory for API responses (default: $output/cache)') do |value|
+      options[:cache_dir] = value
+    end
+    opts.on('--db FILE', "Archive database of post metadata and file provenance " \
+                         "(default: #{ArchiveDb::DEFAULT_PATH})") do |value|
+      options[:db_path] = value
+    end
+    opts.on('--cache-max-age DAYS', Integer,
+            "Drop cached API pages older than DAYS (default: #{Archiver::CACHE_MAX_AGE_DAYS}, 0 disables)") do |value|
+      options[:cache_max_age] = value
+    end
+
+    opts.separator ''
+    opts.separator 'Credentials:'
+    opts.on('-c', '--credentials FILE', 'API credentials file (default: ./<site>-api-credentials.txt)') do |value|
+      options[:credentials] = value
+    end
+
+    opts.separator ''
+    opts.separator 'Run behaviour:'
+    opts.on('--dry-run', 'Preview posts that would be archived, writing nothing to disk') do
+      options[:dry_run] = true
+    end
+    opts.on('--recache-post-tags', 'Refresh the stored metadata of every archived post, ' \
+                                   'and regenerate missing sidecars (no downloads)') do
+      options[:recache_post_tags] = true
+    end
+    opts.on('--[no-]pools', 'Bundle a whole collection directory when a found post belongs to one') do |value|
+      options[:pools] = value
+    end
+    opts.on('--[no-]repair-missing',
+            'Re-fetch posts that have a sidecar but no media file (default on)') do |value|
+      options[:repair_missing] = value
+    end
+    opts.on('--verify-md5', 'Re-hash archived files against the database on startup (slow)') do
+      options[:verify_md5] = true
+    end
+    opts.on('--notify URL', 'POST a JSON run report to URL on completion (ntfy/Slack/Discord webhook)') do |value|
+      options[:notify] = value
+    end
+
+    opts.separator ''
+    opts.separator 'Tuning:'
+    opts.on('-j', '--threads N', Integer, 'Download worker threads (default: 2)') do |value|
+      options[:threads] = value
+    end
+    opts.on('--rate-limit N', Float,
+            "Requests per second *per worker thread* (default: #{Archiver::DEFAULT_REQUESTS_PER_SECOND}; " \
+            'the run total is this times --threads)') do |value|
+      options[:rate_limit] = value
+    end
+
+    opts.separator ''
+    opts.separator 'Logging:'
     opts.on('-v', '--verbose', 'Verbose output') { options[:verbose] = true }
     opts.on('--json', 'JSON log output (machine-parseable)') { options[:json] = true }
-    opts.on('-j', '--threads N', Integer, 'Number of worker threads (default: 2)') { |v| options[:threads] = v }
-    opts.on('--rate-limit N', Float, 'API requests per second (default: 1)') { |v| options[:rate_limit] = v }
-    opts.on('-b', '--blacklist FILE', 'Blacklist file (e621 syntax, default: ./blacklist.txt)') { |v| options[:blacklist] = v }
-    opts.on('--notify URL', 'POST a JSON run report to URL on completion (e.g. ntfy/Slack/Discord webhook)') { |v| options[:notify] = v }
-    opts.on('--recache-post-tags', 'Refresh local tag cache for all existing posts from API') { options[:recache_post_tags] = true }
-    opts.on('-C', '--cache-dir DIR', 'Cache directory for API responses (default: $output_dir/cache)') { |v| options[:cache_dir] = v }
 
+    opts.separator ''
     opts.on('-h', '--help', 'Show this help message') do
       puts opts
       exit 0
     end
+    opts.on('--version', 'Show the rubichiver version') do
+      puts "rubichiver #{Rubichiver::VERSION}"
+      exit 0
+    end
   end
 
-  parser.parse!(remaining)
-
-  unless options[:credentials]
-    options[:credentials] = site == 'gelbooru' ? './gelbooru-api-credentials.txt' : './e621-api-credentials.txt'
+  begin
+    parser.parse!
+  rescue OptionParser::ParseError => e
+    warn "Error: #{e.message}"
+    warn ''
+    warn parser.to_s
+    exit 1
   end
+
+  site = options.delete(:site)
+  if site.nil?
+    warn parser.to_s
+    warn ''
+    warn "Error: --site is required (one of: #{sites.keys.join(', ')})"
+    exit 1
+  end
+
+  config = sites[site]
+  unless config
+    warn "Error: --site must be one of #{sites.keys.join(', ')}, got '#{site}'"
+    exit 1
+  end
+
+  options[:credentials] ||= config[:credentials]
+  # Both sites share one database by default, so an archive can be queried as a
+  # whole. --db still points it somewhere else.
+  options[:db_path] ||= ArchiveDb::DEFAULT_PATH
+  notify_url = options.delete(:notify)
 
   Rubichiver::Logger.configure(
     level: options[:verbose] ? :debug : :info,
     format: options[:json] ? :json : :human
   )
 
-  archiver = case site
-  when 'e621'
-    E621Archiver.new(
-      output_dir: options[:output],
-      tags_file: options[:tags],
-      credentials_file: options[:credentials],
-      blacklist_file: options[:blacklist],
-      dry_run: options[:dry_run],
-      thread_count: options[:threads],
-      rate_limit: options[:rate_limit],
-      verbose: options[:verbose],
-      notify_url: options[:notify],
-      cache_dir: options[:cache_dir],
-      recache_post_tags: options[:recache_post_tags]
-    )
-  when 'gelbooru'
-    GelbooruArchiver.new(
-      output_dir: options[:output],
-      tags_file: options[:tags],
-      credentials_file: options[:credentials],
-      blacklist_file: options[:blacklist],
-      dry_run: options[:dry_run],
-      thread_count: options[:threads],
-      rate_limit: options[:rate_limit],
-      verbose: options[:verbose],
-      notify_url: options[:notify],
-      cache_dir: options[:cache_dir],
-      recache_post_tags: options[:recache_post_tags]
-    )
-  end
+  archiver = config[:archiver].new(
+    output_dir: options[:output],
+    tags_file: options[:tags],
+    credentials_file: options[:credentials],
+    blacklist_file: options[:blacklist],
+    dry_run: options[:dry_run],
+    thread_count: options[:threads],
+    rate_limit: options[:rate_limit],
+    verbose: options[:verbose],
+    notify_url: notify_url,
+    cache_dir: options[:cache_dir],
+    db_path: options[:db_path],
+    pools: options[:pools],
+    repair_missing: options[:repair_missing],
+    verify_md5: options[:verify_md5],
+    recache_post_tags: options[:recache_post_tags],
+    cache_max_age: options[:cache_max_age]
+  )
 
   archiver.install_signal_handlers
   archiver.run
