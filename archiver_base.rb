@@ -654,6 +654,7 @@ class Archiver
     request = Net::HTTP::Post.new(uri)
     request['Content-Type'] = 'application/json'
     request['User-Agent'] = user_agent
+    apply_notification_auth(request)
     request.body = JSON.generate(payload)
 
     response = http.request(request)
@@ -662,6 +663,20 @@ class Archiver
     log_warn "Alert notification failed", status: response&.code, api: true
   rescue *NETWORK_ERRORS => e
     log_warn "Alert notification failed: #{e.message}", api: true
+  end
+
+  # Credentials ride in the notify URL as standard userinfo
+  # (https://user:pass@host/topic), which is the only auth ntfy needs and needs
+  # no extra flag or option surface. Read off @notify_url rather than the
+  # request target, because notification_target drops the userinfo along with
+  # the topic. Nothing here logs the password.
+  def apply_notification_auth(request)
+    uri = URI(@notify_url)
+    return if uri.user.nil? || uri.password.nil?
+
+    request.basic_auth(uri.user, URI.decode_www_form_component(uri.password))
+  rescue StandardError => e
+    log_warn "Notify URL credentials unreadable: #{e.message}", api: true
   end
 
   # ntfy only parses title/message/priority/tags from a JSON body when the topic

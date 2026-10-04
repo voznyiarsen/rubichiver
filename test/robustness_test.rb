@@ -235,6 +235,42 @@ rescue StandardError => e
   flunk "a dead webhook must not raise: #{e.class}: #{e.message}"
 end
 
+# Credentials ride in the notify URL as standard userinfo, which is the only
+# auth ntfy needs. Read off @notify_url, not the request target: the target is
+# rebuilt from scheme/host/port for ntfy and has already dropped them.
+def test_notification_credentials_come_from_the_url_userinfo
+  archiver = notifying_archiver('https://alice:s3cr3t@ntfy.example.com/rubichiver')
+
+  request = Net::HTTP::Post.new(archiver.send(:notification_target))
+  archiver.send(:apply_notification_auth, request)
+
+  assert_equal "Basic #{['alice:s3cr3t'].pack('m0')}", request['Authorization']
+  assert_equal 'https://ntfy.example.com/', request.uri.to_s,
+               'the topic is dropped, but the credentials must survive'
+end
+
+# A password containing characters that are reserved in a URI must arrive
+# intact: URI#password hands back the still-encoded form.
+def test_notification_credentials_are_percent_decoded
+  archiver = notifying_archiver('https://alice:p%40ss%3Aword@ntfy.example.com/rubichiver')
+
+  request = Net::HTTP::Post.new(archiver.send(:notification_target))
+  archiver.send(:apply_notification_auth, request)
+
+  assert_equal "Basic #{['alice:p@ss:word'].pack('m0')}", request['Authorization']
+end
+
+# Most webhooks are open, so a URL with no credentials must send no
+# Authorization header at all rather than an empty one (which servers reject).
+def test_notification_without_credentials_sends_no_authorization_header
+  archiver = notifying_archiver('https://ntfy.example.com/rubichiver')
+
+  request = Net::HTTP::Post.new(archiver.send(:notification_target))
+  archiver.send(:apply_notification_auth, request)
+
+  assert_nil request['Authorization']
+end
+
 def notifying_archiver(url)
   E621Archiver.new(output_dir: @dir, db_path: File.join(@dir, 'db'),
                    username: 'tester', api_key: 'key', notify_url: url)

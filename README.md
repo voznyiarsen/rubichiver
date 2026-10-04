@@ -237,11 +237,17 @@ end-of-run report and mid-run throttle alerts, give the tool a webhook URL:
 ruby rubichiver.rb --site e621 ... --notify https://ntfy.example.com/my-topic
 ```
 
-The systemd units do this with an environment variable so scheduled runs
-report with no flags:
+The systemd units do this with an environment file so scheduled runs report
+with no flags, and so the password is not baked into a world-readable unit:
 
+```ini
+# ~/.config/systemd/user/rubichiver-archive.service
+EnvironmentFile=-%h/.config/rubichiver/notify.env
 ```
-Environment=RUBICHIVER_NOTIFY_URL=https://ntfy.example.com/my-topic
+
+```bash
+# ~/.config/rubichiver/notify.env   (chmod 600 — it usually holds a password)
+RUBICHIVER_NOTIFY_URL=https://user:password@ntfy.example.com/my-topic
 ```
 
 ntfy is fully supported: put the topic in the URL path and subscribe with
@@ -249,6 +255,14 @@ ntfy is fully supported: put the topic in the URL path and subscribe with
 POST receives an event-shaped body (`event`, `title`, `message`, `priority`,
 `tags`, `timestamp`). A notification that fails to deliver is logged and never
 fails the run.
+
+If the webhook needs credentials, put them in the URL as standard userinfo
+(`https://user:password@host/topic`) and they are sent as HTTP basic auth —
+percent-encoded characters are decoded first, so a password containing `@` or
+`:` survives. A URL with no credentials sends no `Authorization` header at all.
+Nothing logs the password. Note that an ntfy server with
+`auth-default-access: deny-all` needs an account explicitly granted write access
+to the topic; anonymous publishes are refused with HTTP 403.
 
 Both timers use `Persistent=true`, so a run missed while the machine was off
 fires once on the next boot. The units run `run-archive.sh` / `run-recheck.sh`,
