@@ -271,9 +271,79 @@ def test_notification_without_credentials_sends_no_authorization_header
   assert_nil request['Authorization']
 end
 
-def notifying_archiver(url)
+# The run is announced once it is genuinely under way. Its job is to bound the
+# silence: the work that follows takes hours, so a start with no matching
+# end-of-run report is the only sign the process died part way.
+def test_a_started_run_announces_itself_before_the_long_phase
+  archiver = notifying_archiver('https://ntfy.example.com/rubichiver', thread_count: 4, rate_limit: 8)
+  sent = capture_notifications(archiver)
+
+  archiver.send(:notify_start)
+
+  assert_equal 1, sent.size
+  assert_equal 'e621 archive starting', sent.first['title']
+  assert_equal 3, sent.first['priority']
+  assert_includes sent.first['message'], 'mode: archive'
+  assert_includes sent.first['message'], 'workers: 4'
+  assert_includes sent.first['message'], 'rate limit: 8/s per worker'
+end
+
+# The three modes read differently at a glance, which is the whole point of
+# announcing them separately.
+def test_the_start_notification_names_the_mode_it_is_in
+  {
+    {} => 'e621 archive starting',
+    { recache_post_tags: true } => 'e621 recache starting',
+    { dry_run: true } => 'e621 dry run starting'
+  }.each do |opts, expected|
+    archiver = notifying_archiver('https://ntfy.example.com/rubichiver', **opts)
+    sent = capture_notifications(archiver)
+    archiver.send(:notify_start)
+    assert_equal expected, sent.first['title']
+  end
+end
+
+# Same privacy rule as the end-of-run report: counters and settings only. The
+# archive's paths, its tag queries and the account name must not travel.
+def test_the_start_notification_carries_no_paths_or_tags
+  archiver = notifying_archiver('https://ntfy.example.com/rubichiver')
+  sent = capture_notifications(archiver)
+
+  archiver.send(:notify_start)
+
+  message = sent.first['message']
+  refute_includes message, archiver.output_dir.to_s
+  refute_includes message, 'tester'
+  refute_includes message, @dir
+  # Only "N/s" may contain a slash, which is what "per worker" is for.
+  scrubbed = message.gsub(%r{\d+/s}, '')
+  refute_includes scrubbed, '/'
+end
+
+# Gelbooru has no pools, so announcing "bundled" there would be a lie.
+def test_the_start_notification_reports_pools_per_site
+  e621 = notifying_archiver('https://ntfy.example.com/rubichiver')
+  sent = capture_notifications(e621)
+  e621.send(:notify_start)
+  assert_includes sent.first['message'], 'pools: bundled'
+
+  gelbooru = GelbooruArchiver.new(output_dir: @dir, db_path: File.join(@dir, 'db'),
+                                 username: 'tester', api_key: 'key',
+                                 notify_url: 'https://ntfy.example.com/rubichiver')
+  sent = capture_notifications(gelbooru)
+  gelbooru.send(:notify_start)
+  assert_includes sent.first['message'], 'pools: disabled'
+end
+
+def capture_notifications(archiver)
+  sent = []
+  archiver.define_singleton_method(:post_notification) { |payload| sent << payload }
+  sent
+end
+
+def notifying_archiver(url, **opts)
   E621Archiver.new(output_dir: @dir, db_path: File.join(@dir, 'db'),
-                   username: 'tester', api_key: 'key', notify_url: url)
+                   username: 'tester', api_key: 'key', notify_url: url, **opts)
 end
 
 def respond_with(code)

@@ -274,6 +274,10 @@ class Archiver
     log_info "Archive database: #{@db.path} (#{@db.persistent? ? @db.inspect : 'not persistent'})" if @db.enabled?
     log_info ""
 
+    # Once every startup step that can abort the run has already succeeded, so
+    # this only ever fires for a run that is genuinely about to work.
+    notify_start
+
     begin
       collect_and_process
     ensure
@@ -615,6 +619,19 @@ class Archiver
     log_warn "Alert notification failed: #{e.message}", api: true
   end
 
+  # The run is under way. Its purpose is to bound the silence: the work that
+  # follows is measured in hours, and the only other notification is the
+  # end-of-run report. A start with no matching report means the run died part
+  # way, which is otherwise indistinguishable from a slow one.
+  def notify_start
+    notify_event(
+      "#{site_name} #{run_mode_label} starting",
+      run_start_summary,
+      priority: 3,
+      tags: [run_mode_tag]
+    )
+  end
+
   def notification_body(title, message, priority, tags)
     uri = URI(@notify_url)
     # ntfy takes the topic from the URL path and the rest as a JSON body; a bare
@@ -632,6 +649,32 @@ class Archiver
 
   def topic_from(uri)
     uri.path.to_s.sub(%r{\A/}, '')
+  end
+
+  def run_mode_label
+    return 'recache' if @recache_post_tags
+    return 'dry run' if @dry_run
+
+    'archive'
+  end
+
+  def run_mode_tag
+    return 'arrows_counterclockwise' if @recache_post_tags
+    return 'test_tube' if @dry_run
+
+    'rocket'
+  end
+
+  # Counters and settings only, for the same reason the end-of-run report is:
+  # nothing that identifies the archive or its contents leaves the machine.
+  def run_start_summary
+    [
+      "mode: #{run_mode_label}  workers: #{@thread_count}  " \
+      "rate limit: #{@rate_limit}/s per worker",
+      "pools: #{pools_active? ? 'bundled' : 'disabled'}  " \
+      "repair missing: #{repair_missing? ? 'on' : 'off'}",
+      "archive holds #{@existing_posts.size} existing file(s)"
+    ].join("\n")
   end
 
   def report_summary(report)

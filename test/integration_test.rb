@@ -23,7 +23,7 @@ class FullRunTest < Minitest::Test
     FileUtils.remove_entry(@dir)
   end
 
-  def build_archiver
+  def build_archiver(notify_url: nil)
     E621Archiver.new(
       output_dir: @dir,
       cache_dir: File.join(@dir, 'cache'),
@@ -32,7 +32,8 @@ class FullRunTest < Minitest::Test
       blacklist_file: File.join(@dir, 'blacklist.txt'),
       username: 'tester',
       api_key: 'key',
-      rate_limit: 1000
+      rate_limit: 1000,
+      notify_url: notify_url
     )
   end
 
@@ -78,6 +79,46 @@ class FullRunTest < Minitest::Test
     assert File.exist?(File.join(@dir, 'posts', '4242.xmp'))
     posts_children = Dir.exist?(File.join(@dir, 'posts')) ? Dir.children(File.join(@dir, 'posts')) : []
     assert_empty posts_children.select { |name| name.end_with?('.part') }
+  end
+
+  # A run bracketed by a start and a finish alert is the only way to tell a
+  # process that died part way from one that is merely slow, so both must be
+  # sent, in that order, from a run that actually completed.
+  def test_a_full_run_announces_both_its_start_and_its_finish
+    archiver = build_archiver(notify_url: 'https://ntfy.example.com/rubichiver')
+    sent = []
+    archiver.define_singleton_method(:post_notification) { |payload| sent << payload }
+    stub_http_get(archiver) do |uri, _n|
+      if uri.host == 'e621.net'
+        StubHttp::Response.new(200, JSON.generate([post(4242)]))
+      else
+        StubHttp::Response.new(200, PNG)
+      end
+    end
+
+    assert_equal 0, (assert_raises(SystemExit) { archiver.run }).status
+
+    assert_equal ['e621 archive starting', 'e621 run finished'], sent.map { |p| p['title'] }
+    assert_equal [3, 3], sent.map { |p| p['priority'] }
+    assert_equal 'rubichiver', sent.first['topic']
+    assert_includes sent.last['message'], 'downloaded: 1'
+  end
+
+  # A run that cannot start must not claim it started. The lock is taken before
+  # the announcement, so a second concurrent run on the same archive exits
+  # quietly instead of paging you about a run that never worked.
+  def test_a_run_locked_out_of_the_archive_sends_no_start_alert
+    stub_transport
+    assert_equal 0, run_archiver
+
+    sent = []
+    contender = build_archiver(notify_url: 'https://ntfy.example.com/rubichiver')
+    contender.define_singleton_method(:post_notification) { |payload| sent << payload }
+    stub_http_get(contender) { StubHttp::Response.new(200, JSON.generate([post(4243)])) }
+
+    assert_equal 1, (assert_raises(SystemExit) { contender.run }).status
+
+    assert_empty sent, 'a run that could not take the lock must not announce a start'
   end
 
   def test_second_run_skips_posts_whose_sidecar_is_current

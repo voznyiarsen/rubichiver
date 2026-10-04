@@ -231,7 +231,8 @@ journalctl --user -u rubichiver-archive.service -f   # follow the log
 
 Alerts go wherever you point them — nothing is configured out of the box, and
 a run without a notification target simply logs to the journal. To receive the
-end-of-run report and mid-run throttle alerts, give the tool a webhook URL:
+start/end-of-run reports and mid-run throttle alerts, give the tool a webhook
+URL:
 
 ```bash
 ruby rubichiver.rb --site e621 ... --notify https://ntfy.example.com/my-topic
@@ -249,6 +250,25 @@ EnvironmentFile=-%h/.config/rubichiver/notify.env
 # ~/.config/rubichiver/notify.env   (chmod 600 — it usually holds a password)
 RUBICHIVER_NOTIFY_URL=https://user:password@ntfy.example.com/my-topic
 ```
+
+Three things are sent, and nothing else:
+
+| Alert | When | Priority |
+|-------|------|----------|
+| `<site> archive starting` | once the run is genuinely under way | 3 |
+| `<site> recache starting` | ditto, for `--recache-post-tags` | 3 |
+| `<site> run finished` | end of the run, with its counters | 3 or 5 |
+| `<site> rate limited — slowed to …` | mid-run, on a real back-off escalation | 5 |
+
+The start alert is what makes the silence bounded. A run takes hours and its
+only other notification is the final report, so a start with no matching finish
+means the process died part way — otherwise that is indistinguishable from a
+run that is merely slow. It fires after every startup step that could abort the
+run has already succeeded, so a run that never started never claims it did; a
+run locked out of the archive by a concurrent one is silent.
+
+Both reports carry counters and settings only — no tags, filenames, paths,
+source URLs or credentials leave the machine.
 
 ntfy is fully supported: put the topic in the URL path and subscribe with
 `curl -s ntfy.example.com/my-topic/json`. Anything else that accepts a JSON
