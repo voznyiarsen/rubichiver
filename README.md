@@ -229,14 +229,26 @@ systemctl --user start rubichiver-archive.service    # run now
 journalctl --user -u rubichiver-archive.service -f   # follow the log
 ```
 
-Alerts go to `https://ntfy.sh/rubichiver` (set in both units via
-`RUBICHIVER_NOTIFY_URL`). Subscribe with:
+Alerts go wherever you point them — nothing is configured out of the box, and
+a run without a notification target simply logs to the journal. To receive the
+end-of-run report and mid-run throttle alerts, give the tool a webhook URL:
 
 ```bash
-curl -s ntfy.sh/rubichiver/json
+ruby rubichiver.rb --site e621 ... --notify https://ntfy.example.com/my-topic
 ```
 
-Change the `Environment=` line in both units to use a different topic.
+The systemd units do this with an environment variable so scheduled runs
+report with no flags:
+
+```
+Environment=RUBICHIVER_NOTIFY_URL=https://ntfy.example.com/my-topic
+```
+
+ntfy is fully supported: put the topic in the URL path and subscribe with
+`curl -s ntfy.example.com/my-topic/json`. Anything else that accepts a JSON
+POST receives an event-shaped body (`event`, `title`, `message`, `priority`,
+`tags`, `timestamp`). A notification that fails to deliver is logged and never
+fails the run.
 
 Both timers use `Persistent=true`, so a run missed while the machine was off
 fires once on the next boot. The units run `run-archive.sh` / `run-recheck.sh`,
