@@ -47,13 +47,15 @@ class ArchiveDb
   # sentinel instead.
   ROOT_POOL = 0
 
-  BATCH_STATEMENTS = 500
-  BATCH_SECONDS = 5.0
+  BATCH_STATEMENTS = 2000
+  BATCH_SECONDS = 15.0
   BUSY_TIMEOUT_MS = 15_000
   # Fold the write-ahead log back into the database once it grows past this. A
   # bulk import appends to it faster than it drains, and on a slow disk an
   # oversized log turns every commit into a long journal flush: observed
   # blocking in xlog_wait_on_iclog with a 340 MB log on a spinning drive.
+  # Commits land roughly every 25 posts at this size, so a SIGKILL loses at most
+  # that much metadata; the files stay on disk and the next run re-adopts them.
   WAL_CHECKPOINT_BYTES = 16 * 1024 * 1024
   # SQLite leaves a checkpointed log at whatever size it reached, so on its own
   # the file only ever grows across a long import. Capping it means the log is
@@ -242,11 +244,54 @@ class ArchiveDb
   end
 
   def post_count
-    count('posts')
+    counter_value('posts') || count('posts')
   end
 
   def tag_count
-    count('tags')
+    counter_value('tags') || count('tags')
+  end
+
+  # A cached count, or nil when this store predates the counters table and has
+  # not been backfilled yet. Reads only: seeding happens once in
+  # backfill_counters!, never on the read path.
+  def counter_value(kind)
+    row = select_one('SELECT value AS v FROM counters WHERE site = ? AND kind = ?', [@site, kind])
+    row && !row['v'].nil? ? row['v'].to_i : nil
+  rescue SQLite3::Exception
+    nil
+  end
+
+  def set_counter(kind, value)
+    run('INSERT INTO counters (site, kind, value) VALUES (?,?,?) ' \
+        'ON CONFLICT(site, kind) DO UPDATE SET value = excluded.value',
+        [@site, kind, value])
+  end
+
+  def bump_counter(kind, delta)
+    return if delta.nil? || delta.zero?
+
+    run('INSERT INTO counters (site, kind, value) VALUES (?,?,?) ' \
+        'ON CONFLICT(site, kind) DO UPDATE SET value = value + excluded.value',
+        [@site, kind, delta])
+  end
+
+  # Seeds the counters from the tables the first time a pre-counter database is
+  # opened. The tags COUNT(*) is the slow one (tens of minutes on 4.5M rows of
+  # spinning disk), but it runs exactly once; every later open reads two rows.
+  def backfill_counters!
+    { 'posts' => 'posts', 'tags' => 'tags' }.each do |kind, table|
+      next unless counter_value(kind).nil?
+
+      set_counter(kind, count(table))
+    end
+    flush_batch
+  rescue SQLite3::Exception, SystemCallError, IOError
+    nil
+  end
+
+  def tag_count_for_post(post_id)
+    select_one('SELECT COUNT(*) AS n FROM tags WHERE site = ? AND post_id = ?',
+               [@site, post_id])&.fetch('n', 0).to_i
   end
 
   def pool_member_ids(pool_id)
@@ -371,6 +416,11 @@ class ArchiveDb
       # what --recache-post-tags asks for) is the way to force the tag list to be
       # rewritten, so a tag changed upstream can still be corrected.
       known = !refresh && tags_known?(post_id)
+      # The posts counter needs new-vs-replace, and INSERT OR REPLACE does not
+      # say which it did. One indexed point read; record_post runs on the main
+      # thread at discovery, so no worker can slip in between.
+      is_new = select_one('SELECT 1 AS x FROM posts WHERE site = ? AND post_id = ?',
+                          [@site, post_id]).nil?
       values = {
         'site' => @site, 'post_id' => post_id, 'rating' => rating, 'created_at' => created_at,
         'updated_at' => updated_at, 'change_seq' => change_seq, 'md5' => md5, 'ext' => ext,
@@ -403,8 +453,11 @@ class ArchiveDb
       run("INSERT OR REPLACE INTO posts (#{POST_COLUMNS.join(', ')}) " \
           "VALUES (#{Array.new(POST_COLUMNS.size, '?').join(',')})",
           POST_COLUMNS.map { |column| values[column] })
+      bump_counter('posts', 1) if is_new
 
-      replace_tags(post_id, tags) if tags && !known
+      # A new post has no rows to delete, so skip that read; a recache passes
+      # refresh: true and goes through the counted path inside.
+      replace_tags(post_id, tags, old_count: (is_new ? 0 : nil)) if tags && !known
       replace_sources(post_id, sources) if sources && !known
       # The raw record and the nested lists it describes are refreshed with the
       # tags rather than on every write. They change only when the post does,
@@ -564,14 +617,18 @@ class ArchiveDb
     row
   end
 
-  def replace_tags(post_id, tags)
+  def replace_tags(post_id, tags, old_count: nil)
+    old_count = tag_count_for_post(post_id) if old_count.nil?
     run('DELETE FROM tags WHERE site = ? AND post_id = ?', [@site, post_id])
+    inserted = 0
     tags.each do |category, names|
       Array(names).each do |tag|
         run('INSERT OR IGNORE INTO tags (site, post_id, category, tag) VALUES (?,?,?,?)',
                    [@site, post_id, category.to_s, tag.to_s])
+        inserted += 1
       end
     end
+    bump_counter('tags', inserted - old_count)
   end
 
   def replace_sources(post_id, sources)
@@ -639,16 +696,35 @@ class ArchiveDb
     select_one("SELECT COUNT(*) AS n FROM #{table} WHERE site = ?", [@site])&.fetch('n', nil).to_i
   end
 
-  # Executes a write, holding the batch open so a run's writes commit together.
-  # Safe to call from inside an already-locked read, so helpers can compose.
+  # Executes a write inside the open batch, so a run's writes commit together
+  # instead of one COMMIT per statement. Safe to call from inside an
+  # already-locked read, so helpers can compose.
   #
   # `immediate: true` commits straight away, for the few records a hard kill
   # must not be able to lose — a pool slug names the directory a whole bundle
   # lives in, so losing one would move that bundle on the next run.
   def run(sql, binds, immediate: false)
-    guard { @conn.execute(sql, binds) }
+    guard do
+      @lock.synchronize do
+        begin_batch
+        @conn.execute(sql, binds)
+      end
+    end
     track_batch
-    flush_batch if immediate
+    @lock.synchronize { flush_batch } if immediate
+  end
+
+  # Opens the batch transaction. Called before the write, not after, so the
+  # statement actually lands inside it; the old order (BEGIN after EXECUTE)
+  # left every statement auto-committing and the batch forever empty.
+  def begin_batch
+    return unless @persistent
+    return if @in_batch
+
+    @conn.execute('BEGIN IMMEDIATE')
+    @in_batch = true
+    @batch_statements = 0
+    @batch_started_at = monotonic_now
   end
 
   # Holds the batch open across a multi-statement write, so a post's row, its
@@ -669,12 +745,11 @@ class ArchiveDb
   def guard(recovered = false)
     return nil unless connected?
 
-    # Commit anything batched but not yet written, so a read always sees this
-    # process's own most recent records.
-    @lock.synchronize do
-      flush_batch if @in_batch
-      yield
-    end
+    # No pre-flush here: reads on this connection see the open batch's writes
+    # already, and flushing first would commit a half-written post in the middle
+    # of hold_batch. Commits happen at post boundaries (hold_batch release),
+    # batch thresholds, immediates and close.
+    @lock.synchronize { yield }
   rescue *CORRUPT_ERRORS => e
     raise if recovered
 
@@ -689,26 +764,24 @@ class ArchiveDb
 
   def track_batch
     return unless @persistent
-    return if (@batch_hold || 0).positive?
+    return unless @in_batch
 
-    unless @in_batch
-      @conn.execute('BEGIN IMMEDIATE')
-      @in_batch = true
-      @batch_statements = 0
-      @batch_started_at = monotonic_now
+    @lock.synchronize do
+      @batch_statements += 1
+      return if (@batch_hold || 0).positive?
+      return unless @batch_statements >= BATCH_STATEMENTS || monotonic_now - @batch_started_at >= BATCH_SECONDS
+
+      flush_batch
     end
-
-    @batch_statements += 1
-    return unless @batch_statements >= BATCH_STATEMENTS || monotonic_now - @batch_started_at >= BATCH_SECONDS
-
-    flush_batch
   end
 
   def flush_batch
-    return unless @in_batch
+    @lock.synchronize do
+      return unless @in_batch
 
-    @conn.execute('COMMIT')
-    checkpoint_wal
+      @conn.execute('COMMIT')
+      checkpoint_wal
+    end
   rescue SQLite3::Exception
     begin
       @conn.execute('ROLLBACK')
@@ -720,14 +793,15 @@ class ArchiveDb
     @batch_statements = 0
   end
 
-  # Checked at a commit boundary, where it costs nothing to fold the log back.
-  # TRUNCATE rather than PASSIVE: it resets the file to nothing, which is what
-  # actually keeps the log from creeping up over a multi-hour import.
+  # Checked at a commit boundary. PASSIVE while the run is working: it folds what
+  # it can without blocking writers, which is what matters on a spinning disk.
+  # The log is reset to nothing once, at close, where a blocking checkpoint
+  # costs nothing because no worker is waiting on it.
   def checkpoint_wal
     return unless @persistent
     return if wal_bytes < WAL_CHECKPOINT_BYTES
 
-    @conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    @conn.execute('PRAGMA wal_checkpoint(PASSIVE)')
   rescue SQLite3::Exception
     nil
   end
@@ -761,6 +835,7 @@ class ArchiveDb
     end
 
     create_schema!
+    backfill_counters!
     @tag_types = nil
   end
 
@@ -974,6 +1049,16 @@ class ArchiveDb
       tag      TEXT NOT NULL,
       category TEXT NOT NULL,
       PRIMARY KEY (site, tag)
+    ) WITHOUT ROWID;
+
+    -- Cached row counts, so the end-of-run summary never runs COUNT(*) over
+    -- millions of tag rows on a spinning disk. Maintained incrementally by the
+    -- record paths below and seeded once by backfill_counters! on migration.
+    CREATE TABLE IF NOT EXISTS counters (
+      site  TEXT    NOT NULL,
+      kind  TEXT    NOT NULL,
+      value INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (site, kind)
     ) WITHOUT ROWID;
   SQL
 

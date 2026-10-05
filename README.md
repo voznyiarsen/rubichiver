@@ -117,8 +117,10 @@ keywords, and enough provenance to identify the artwork offline:
 
 A sidecar is rewritten when any of those fields drifts from what the post
 currently says — including a tag that was *deleted* upstream, which is cleaned
-out rather than left behind. Upgrading rubichiver changes `CreatorTool`, so a
-new version refreshes the sidecars of every post it re-discovers.
+out rather than left behind. `CreatorTool` carries the version and the account
+name for provenance, but only the tool name is compared: upgrading rubichiver
+or renaming the account does not rewrite every sidecar in the archive. A
+sidecar written by anything else still invalidates, as it should.
 
 If the site answers with a flat tag list instead of categorized ones, no
 keyword sidecar is written rather than one filled with guessed categories; the
@@ -148,6 +150,7 @@ sqlite3 /mnt/hdd/rubichiver-database.db \
 | `pools`, `pool_posts` | e621 pools, their frozen directory slug, and membership |
 | `files` | Where each file lives, its MD5, size, dimensions, and whether its sidecar was current |
 | `tag_types` | Gelbooru tag category lookups, so they are resolved once rather than once per run |
+| `counters` | Cached per-site post and tag counts, so the summary never runs `COUNT(*)` over millions of rows |
 
 Everything the sites return is kept. The columns are a readable projection of
 `post_raw`, which holds the response exactly as it arrived — so a field this

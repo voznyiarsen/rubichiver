@@ -125,6 +125,39 @@ class SidecarValidationTest < Minitest::Test
     assert_equal %w[bob], Array(sidecar_field('Creator'))
   end
 
+  # The version and the account name both live in CreatorTool, and neither says
+  # anything about the post. A release or a rename must not rewrite every
+  # sidecar in the archive, so only the tool name has to match.
+  def test_a_newer_version_does_not_invalidate_the_sidecar
+    assert @archiver.send(:creator_tool_matches?,
+                          'rubichiver/0.9.0 (e621 media archiver, used by tester)',
+                          'rubichiver/1.0.0 (e621 media archiver, used by tester)')
+  end
+
+  def test_a_renamed_account_does_not_invalidate_the_sidecar
+    assert @archiver.send(:creator_tool_matches?,
+                          'rubichiver/1.0.0 (e621 media archiver, used by oldname)',
+                          'rubichiver/1.0.0 (e621 media archiver, used by newname)')
+  end
+
+  def test_a_sidecar_from_another_tool_is_still_invalid
+    refute @archiver.send(:creator_tool_matches?, 'exiftool 13.25', 'rubichiver/1.0.0 (x)')
+    refute @archiver.send(:creator_tool_matches?, nil, 'rubichiver/1.0.0 (x)')
+    refute @archiver.send(:creator_tool_matches?, '', 'rubichiver/1.0.0 (x)')
+  end
+
+  def test_a_sidecar_written_by_an_older_release_is_current
+    skip 'exiftool not installed' unless exiftool?
+    FileUtils.cp(fixture_image, @media)
+    @archiver.write_sidecar(@media, POST)
+    @archiver.instance_variable_set(:@sidecar_index, nil)
+
+    newer = E621Archiver.new(output_dir: @dir, db_path: File.join(@dir, 'db2'),
+                             username: 'someone-else', api_key: 'k')
+    assert newer.sidecar_valid?(POST, @root),
+           'version and account must not matter, only the post content'
+  end
+
   def test_sidecar_carries_the_provenance_a_browser_needs
     skip 'exiftool not installed' unless exiftool?
     write_real_sidecar

@@ -25,7 +25,10 @@ class Archiver
   API_READ_TIMEOUT = 60
   DOWNLOAD_READ_TIMEOUT = 300
   RECACHE_BATCH_SIZE = 300
-  SIDECAR_READ_BATCH = 500
+  # One exiftool per batch, so bigger batches mean fewer forks. 2000 paths fit
+  # comfortably in an argv; a batch that will not read is still halved until it
+  # does, so an oversized batch degrades rather than fails.
+  SIDECAR_READ_BATCH = 2000
   # Cache entries older than this are dropped at startup, so the cache stays
   # useful without growing without bound.
   CACHE_MAX_AGE_DAYS = 90
@@ -1902,12 +1905,25 @@ class Archiver
     if expected.is_a?(Array)
       # Set equality, so a keyword the post no longer has invalidates the file.
       Array(actual).flatten.map(&:to_s).sort == expected.map(&:to_s).sort
+    elsif key == 'CreatorTool'
+      creator_tool_matches?(actual, expected)
     elsif DATE_SIDECAR_FIELDS.include?(key)
       # exiftool re-renders dates in its own format, so compare instants.
       !canonical_time(actual).nil? && canonical_time(actual) == canonical_time(expected)
     else
       actual.to_s == expected.to_s
     end
+  end
+
+  # The version string and the account name both live in CreatorTool, and neither
+  # says anything about the post. Comparing them exactly rewrites every sidecar
+  # on each release or rename — tens of thousands of exiftool runs for zero new
+  # information — so only the tool name has to match. A sidecar written by
+  # something else still invalidates, as it should.
+  def creator_tool_matches?(actual, expected)
+    actual_tool = actual.to_s.split('/').first.to_s.strip
+    expected_tool = expected.to_s.split('/').first.to_s.strip
+    !actual_tool.empty? && actual_tool == expected_tool
   end
 
   # exiftool reports XMP dates back as "YYYY:MM:DD HH:MM:SS[.sss][Z|±HH:MM]",

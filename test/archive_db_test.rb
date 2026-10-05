@@ -289,6 +289,64 @@ class ArchiveDbTest < Minitest::Test
     assert_equal 2, store.tag_count
   end
 
+  # The summary counts come from the counters table, not from COUNT(*) over
+  # millions of rows, so they have to track every write path.
+  def test_counters_track_posts_and_tags
+    store = db
+    store.record_post(post_id: 7, tags: { 'general' => %w[a b] })
+    store.record_post(post_id: 8, tags: { 'general' => %w[c] })
+
+    assert_equal 2, store.post_count
+    assert_equal 3, store.tag_count
+    assert_equal 2, store.counter_value('posts')
+    assert_equal 3, store.counter_value('tags')
+  end
+
+  # A normal run re-records every post it rediscovers; the counters must not
+  # move when nothing changed, or the summary drifts a little every week.
+  def test_re_recording_a_post_does_not_move_the_counters
+    store = db
+    store.record_post(post_id: 7, tags: { 'general' => %w[a b] })
+    store.record_post(post_id: 7, tags: { 'general' => %w[a b] })
+
+    assert_equal 1, store.post_count
+    assert_equal 2, store.tag_count
+  end
+
+  # A recache that changes the tag list adjusts by the delta, not by the new
+  # total, or a post that loses a tag inflates the count forever.
+  def test_a_refresh_adjusts_the_tag_counter_by_the_delta
+    store = db
+    store.record_post(post_id: 7, tags: { 'general' => %w[a b c] })
+    store.record_post(post_id: 7, tags: { 'general' => %w[a] }, refresh: true)
+
+    assert_equal 1, store.tag_count
+  end
+
+  # A database from before the counters table gains seeded counters on open,
+  # with everything it already held intact.
+  def test_a_pre_counter_database_is_seeded_on_open
+    legacy_path = File.join(@dir, 'nocounters.db')
+    legacy = SQLite3::Database.new(legacy_path)
+    legacy.execute_batch(<<~SQL)
+      CREATE TABLE posts (site TEXT NOT NULL, post_id INTEGER NOT NULL, PRIMARY KEY (site, post_id)) WITHOUT ROWID;
+      CREATE TABLE tags (site TEXT NOT NULL, post_id INTEGER NOT NULL, category TEXT NOT NULL, tag TEXT NOT NULL,
+        PRIMARY KEY (site, post_id, category, tag)) WITHOUT ROWID;
+      INSERT INTO posts (site, post_id) VALUES ('e621', 1), ('e621', 2);
+      INSERT INTO tags (site, post_id, category, tag) VALUES ('e621', 1, 'general', 'a'),
+        ('e621', 1, 'general', 'b'), ('e621', 2, 'general', 'c');
+    SQL
+    legacy.close
+
+    store = db(legacy_path, site: 'e621')
+
+    assert_equal 2, store.post_count
+    assert_equal 3, store.tag_count
+    assert_equal 2, store.counter_value('posts')
+    assert_equal 3, store.counter_value('tags')
+    store.close
+  end
+
   def test_tag_types_persist_between_opens
     store = db
     store.remember_tag_types('cat' => 'general', 'sukiya' => 'artist')
