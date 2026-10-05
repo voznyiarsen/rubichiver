@@ -166,6 +166,60 @@ class ArchiveDb
                .transform_values { |rows| rows.map { |row| row['tag'] } }
   end
 
+  # The verbatim response, for the fields no column models. Parsed on demand
+  # rather than in post_row: most callers want a column, and parsing a blob on
+  # every read of a 4.5M-tag store would be absurd.
+  def raw_post(post_id)
+    row = select_one('SELECT raw_json FROM posts WHERE site = ? AND post_id = ?', [@site, post_id])
+    return nil unless row && row['raw_json']
+
+    JSON.parse(row['raw_json'])
+  rescue JSON::ParserError
+    nil
+  end
+
+  # The verbatim response. Its own row rather than a posts column on purpose: the
+  # blob is ~2.8 KB for a typical e621 post, and posts is rewritten on every run
+  # for every post rediscovered, so keeping it inline means re-serialising
+  # identical bytes tens of thousands of times. Here it is written once, and
+  # rewritten only when a recache says the post actually changed.
+  def record_raw(post_id, raw_json)
+    run('INSERT OR REPLACE INTO post_raw (site, post_id, raw_json, captured_at) VALUES (?,?,?,?)',
+        [@site, post_id, raw_json, Time.now.utc.iso8601])
+  end
+
+  # When the verbatim record was captured, so "has the site changed this?" is a
+  # comparison rather than a diff of two multi-kilobyte documents.
+  def raw_captured_at(post_id)
+    select_one('SELECT captured_at FROM post_raw WHERE site = ? AND post_id = ?',
+               [@site, post_id])&.fetch('captured_at', nil)
+  end
+
+  # The verbatim response, for the fields no column models. Parsed on demand
+  # rather than in post_row: most callers want a column, and parsing a blob on
+  # every read would be absurd.
+  def raw_post(post_id)
+    row = select_one('SELECT raw_json FROM post_raw WHERE site = ? AND post_id = ?', [@site, post_id])
+    return nil unless row && row['raw_json']
+
+    JSON.parse(row['raw_json'])
+  rescue JSON::ParserError
+    nil
+  end
+
+  # Every rendition the site offered, one row per variant and format.
+  def post_variants(post_id)
+    select('SELECT variant, format, width, height, url FROM post_files ' \
+           'WHERE site = ? AND post_id = ? ORDER BY variant, format', [@site, post_id])
+      .map { |row| row.reject { |key, _| %w[site post_id].include?(key) } }
+  end
+
+  # Child post ids, in the order the site listed them.
+  def post_children(post_id)
+    select('SELECT child_id FROM post_children WHERE site = ? AND post_id = ? ORDER BY ordinal',
+           [@site, post_id]).map { |row| row['child_id'] }
+  end
+
   def record_count
     count('pools') + count('files')
   end
@@ -300,7 +354,13 @@ class ArchiveDb
                   page_url: nil, score_up: nil, score_down: nil, score_total: nil,
                   fav_count: nil, comment_count: nil, parent_id: nil, child_count: nil,
                   has_children: nil, flags: nil, stats: nil, locked_tags: nil,
-                  tags: nil, sources: nil)
+                  tags: nil, sources: nil,
+                  has: nil, sample_width: nil, sample_height: nil,
+                  preview_width: nil, preview_height: nil,
+                  is_favorited: nil, vote: nil, hotness: nil,
+                  status: nil, creator_id: nil, creator_anonymous: nil, num_notes: nil,
+                  is_held: nil, is_pending: nil, has_notes: nil,
+                  raw_json: nil, variants: nil, children: nil)
     return unless connected?
 
     @lock.synchronize do
@@ -324,6 +384,19 @@ class ArchiveDb
         'uncategorized' => bool(uncategorized),
         'flags_json' => flags && JSON.generate(flags),
         'stats_json' => stats && JSON.generate(stats), 'locked_tags' => locked_tags && JSON.generate(locked_tags),
+        'has_json' => has && JSON.generate(has),
+        'has_parent' => bool(has.is_a?(Hash) ? has['parent'] : nil),
+        'has_active_children' => bool(has.is_a?(Hash) ? has['active_children'] : nil),
+        # "Has notes" is one fact with two spellings: e621 reports it inside the
+        # has object, Gelbooru as a flat flag. One column, either source.
+        'has_notes' => bool(has_notes.nil? && has.is_a?(Hash) ? has['notes'] : has_notes),
+        'has_sample' => bool(has.is_a?(Hash) ? has['sample'] : nil),
+        'sample_width' => sample_width, 'sample_height' => sample_height,
+        'preview_width' => preview_width, 'preview_height' => preview_height,
+        'is_favorited' => bool(is_favorited), 'vote' => vote, 'hotness' => hotness,
+        'status' => status, 'creator_id' => creator_id,
+        'creator_anonymous' => bool(creator_anonymous), 'num_notes' => num_notes,
+        'is_held' => bool(is_held), 'is_pending' => bool(is_pending),
         'captured_at' => Time.now.utc.iso8601
       }
 
@@ -333,6 +406,12 @@ class ArchiveDb
 
       replace_tags(post_id, tags) if tags && !known
       replace_sources(post_id, sources) if sources && !known
+      # The raw record and the nested lists it describes are refreshed with the
+      # tags rather than on every write. They change only when the post does,
+      # which is exactly when a recache (refresh: true) is what brought us here.
+      record_raw(post_id, raw_json) if raw_json && !known
+      replace_variants(post_id, variants) if variants && !known
+      replace_children(post_id, children) if children && !known
       backfill_file_md5(post_id, md5, ext)
       end
     end
@@ -395,11 +474,24 @@ class ArchiveDb
 
   # One place to keep the insert and its binds in step: placeholders are derived
   # from this list, so a column can never drift out of alignment with its value.
+  # Capability flags the site reports about the post (v2 "has") are columns
+  # because they are worth querying; the whole object is also kept in has_json.
+  # Variant geometry is here so a post's sample/preview size is answerable
+  # without the raw record, while the variant URLs live in post_files. `status`
+  # and its neighbours are Gelbooru's own lifecycle and ownership words: a post
+  # withdrawn upstream still says so there, which is the only record of it once
+  # the bytes are archived. The complete response is *not* a column — see
+  # post_raw and record_post.
   POST_COLUMNS = %w[
     site post_id rating created_at updated_at change_seq md5 ext bytes width height duration
     uploader_id uploader_name approver_id description page_url score_up score_down score_total
     fav_count comment_count parent_id child_count has_children flags_json stats_json
     locked_tags uncategorized captured_at
+    has_parent has_active_children has_notes has_sample
+    sample_width sample_height preview_width preview_height
+    is_favorited vote hotness
+    status creator_id creator_anonymous num_notes is_held is_pending
+    has_json
   ].freeze
 
   # Declared types for columns an older database may need added. SQLite stores
@@ -411,7 +503,13 @@ class ArchiveDb
     'uploader_id' => 'INTEGER', 'approver_id' => 'INTEGER',
     'score_up' => 'INTEGER', 'score_down' => 'INTEGER', 'score_total' => 'INTEGER',
     'fav_count' => 'INTEGER', 'comment_count' => 'INTEGER', 'parent_id' => 'INTEGER',
-    'child_count' => 'INTEGER', 'has_children' => 'INTEGER', 'uncategorized' => 'INTEGER'
+    'child_count' => 'INTEGER', 'has_children' => 'INTEGER', 'uncategorized' => 'INTEGER',
+    'has_parent' => 'INTEGER', 'has_active_children' => 'INTEGER', 'has_notes' => 'INTEGER',
+    'has_sample' => 'INTEGER', 'is_favorited' => 'INTEGER', 'vote' => 'INTEGER',
+    'hotness' => 'REAL', 'sample_width' => 'INTEGER', 'sample_height' => 'INTEGER',
+    'preview_width' => 'INTEGER', 'preview_height' => 'INTEGER',
+    'creator_id' => 'INTEGER', 'num_notes' => 'INTEGER', 'creator_anonymous' => 'INTEGER',
+    'is_held' => 'INTEGER', 'is_pending' => 'INTEGER'
   }.freeze
 
   def connected?
@@ -459,7 +557,7 @@ class ArchiveDb
 
   def post_row(row)
     row = row.dup
-    %w[flags_json stats_json locked_tags].each do |key|
+    %w[flags_json stats_json locked_tags has_json].each do |key|
       value = row.delete(key)
       row[key.sub('_json', '')] = value && (JSON.parse(value) rescue nil)
     end
@@ -483,6 +581,35 @@ class ArchiveDb
 
       run('INSERT OR REPLACE INTO post_sources (site, post_id, ordinal, url) VALUES (?,?,?,?)',
                  [@site, post_id, ordinal, url.to_s])
+    end
+  end
+
+  # Every rendition the site offers, keyed so a re-record replaces rather than
+  # duplicates. A variant with no URL (e.g. a webp preview a site does not
+  # actually serve) is still recorded with its dimensions.
+  def replace_variants(post_id, variants)
+    return if variants.empty?
+
+    run('DELETE FROM post_files WHERE site = ? AND post_id = ?', [@site, post_id])
+    variants.each do |variant|
+      next if variant['variant'].to_s.empty?
+
+      run('INSERT OR REPLACE INTO post_files (site, post_id, variant, format, width, height, url) ' \
+          'VALUES (?,?,?,?,?,?,?)',
+          [@site, post_id, variant['variant'].to_s, variant['format'].to_s,
+           variant['width'], variant['height'], variant['url']])
+    end
+  end
+
+  # Child post ids in site order. The ordinal is the primary key, so the
+  # response order is preserved and a post that gains a child gains a row.
+  def replace_children(post_id, children)
+    run('DELETE FROM post_children WHERE site = ? AND post_id = ?', [@site, post_id])
+    Array(children).each_with_index do |child_id, ordinal|
+      next if child_id.nil?
+
+      run('INSERT OR REPLACE INTO post_children (site, post_id, ordinal, child_id) VALUES (?,?,?,?)',
+          [@site, post_id, ordinal, child_id])
     end
   end
 
@@ -720,6 +847,19 @@ class ArchiveDb
       value TEXT
     );
 
+    -- The complete API response for a post, verbatim. Everything else in this
+    -- schema is a projection of it, so this is the one record that cannot lose a
+    -- field: a site adding something is captured without a code change, and the
+    -- columns can be backfilled from here at any time. It is deliberately its
+    -- own row rather than a column on posts — see record_post.
+    CREATE TABLE IF NOT EXISTS post_raw (
+      site        TEXT    NOT NULL,
+      post_id     INTEGER NOT NULL,
+      raw_json    TEXT    NOT NULL,
+      captured_at TEXT,
+      PRIMARY KEY (site, post_id)
+    ) WITHOUT ROWID;
+
     CREATE TABLE IF NOT EXISTS posts (
       site          TEXT    NOT NULL,
       post_id       INTEGER NOT NULL,
@@ -803,6 +943,30 @@ class ArchiveDb
       height      INTEGER,
       archived_at TEXT,
       PRIMARY KEY (site, post_id, pool_id)
+    ) WITHOUT ROWID;
+
+    -- The file variants e621 offers. The archive only ever keeps the original,
+    -- but the sample and preview URLs are recorded here so the archive can be
+    -- rebuilt (or a different rendition fetched) without asking the site again.
+    CREATE TABLE IF NOT EXISTS post_files (
+      site     TEXT    NOT NULL,
+      post_id  INTEGER NOT NULL,
+      variant  TEXT    NOT NULL,
+      format   TEXT    NOT NULL,
+      width    INTEGER,
+      height   INTEGER,
+      url      TEXT,
+      PRIMARY KEY (site, post_id, variant, format)
+    ) WITHOUT ROWID;
+
+    -- Child posts, in the order the site listed them. relationships.children is
+    -- an array of ids in the v2 response and was previously reduced to a count.
+    CREATE TABLE IF NOT EXISTS post_children (
+      site    TEXT    NOT NULL,
+      post_id INTEGER NOT NULL,
+      ordinal INTEGER NOT NULL,
+      child_id INTEGER NOT NULL,
+      PRIMARY KEY (site, post_id, ordinal)
     ) WITHOUT ROWID;
 
     CREATE TABLE IF NOT EXISTS tag_types (

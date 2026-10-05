@@ -101,6 +101,146 @@ class ArchiveDbTest < Minitest::Test
     assert_equal 9, store.pool(42)['post_count']
   end
 
+  # The raw record is ~2.8 KB of JSON per post and the posts row is rewritten on
+  # every run for every post rediscovered, so it must not be re-serialised when
+  # nothing changed. That is what keeps it in its own row.
+  def test_an_unchanged_post_does_not_rewrite_its_raw_record
+    store = db
+    store.record_post(post_id: 7, raw_json: '{"id":7,"v":1}', tags: { 'general' => %w[cat] })
+    first = store.raw_captured_at(7)
+
+    store.record_post(post_id: 7, raw_json: '{"id":7,"v":1}', tags: { 'general' => %w[cat] })
+
+    assert_equal first, store.raw_captured_at(7), 'a rediscovered post must not rewrite the blob'
+  end
+
+  # But a recache must refresh it, or a field that changed upstream would never
+  # be seen. Asserted on content rather than the timestamp, which only has
+  # second resolution.
+  def test_a_recache_refreshes_the_raw_record
+    store = db
+    store.record_post(post_id: 7, raw_json: '{"id":7,"v":1}')
+
+    store.record_post(post_id: 7, refresh: true, raw_json: '{"id":7,"v":2}')
+
+    assert_equal 2, store.raw_post(7)['v']
+  end
+
+  # The raw response is the one thing in the schema that cannot be a projection
+  # of something else, so it has to come back equivalent.
+  def test_the_raw_response_survives_verbatim
+    store = db
+    payload = { 'id' => 7, 'files' => { 'meta' => { 'ext' => 'png' } },
+                'stats' => { 'hotness' => 1.5 }, 'pools' => [59203],
+                'tags' => { 'general' => %w[cat] } }
+    store.record_post(post_id: 7, raw_json: JSON.generate(payload), md5: 'abc')
+
+    assert_equal payload, store.raw_post(7)
+  end
+
+  # Nothing is lost even when no column models a field, which is the whole
+  # reason the raw record exists: a site can add a key and it is still captured.
+  def test_a_field_no_column_models_is_still_kept
+    store = db
+    store.record_post(post_id: 7, raw_json: JSON.generate('id' => 7, 'brand_new_field' => [1, 2]))
+
+    assert_equal [1, 2], store.raw_post(7)['brand_new_field']
+    assert_nil store.post(7)['brand_new_field']
+  end
+
+  # The "has" object is worth querying, so it is both columns and json. SQLite
+  # stores booleans as 0/1, which is how every flag column reads back.
+  def test_the_capability_flags_land_in_columns_and_as_json
+    store = db
+    store.record_post(post_id: 7, has: { 'parent' => true, 'children' => false,
+                                         'active_children' => false, 'notes' => true, 'sample' => true })
+
+    row = store.post(7)
+    assert_equal 1, row['has_parent']
+    assert_equal 1, row['has_notes']
+    assert_equal 1, row['has_sample']
+    assert_equal 0, row['has_active_children']
+    assert_equal true, row['has']['notes']
+  end
+
+  # Gelbooru spells the same fact as a flat flag instead of an object.
+  def test_has_notes_is_recorded_from_either_spelling
+    store = db
+    store.record_post(post_id: 7, has_notes: true)
+    assert_equal 1, store.post(7)['has_notes']
+
+    store.record_post(post_id: 8, has: { 'notes' => true })
+    assert_equal 1, store.post(8)['has_notes']
+  end
+
+  # Every rendition on offer, one row each, so a sample or preview can be
+  # fetched later without asking the site again.
+  def test_every_file_variant_is_recorded
+    store = db
+    store.record_post(post_id: 7, md5: 'abc', ext: 'jpg', variants: [
+                        { 'variant' => 'original', 'format' => 'jpg', 'width' => 1457,
+                          'height' => 1032, 'url' => 'https://static.example/orig.jpg' },
+                        { 'variant' => 'sample', 'format' => 'jpg', 'width' => 1200,
+                          'height' => 850, 'url' => 'https://static.example/s.jpg' },
+                        { 'variant' => 'sample', 'format' => 'webp', 'width' => 1200,
+                          'height' => 850, 'url' => 'https://static.example/s.webp' }
+                      ])
+
+    variants = store.post_variants(7)
+    assert_equal 3, variants.size
+    assert_equal %w[original sample sample], variants.map { |v| v['variant'] }
+    assert_equal %w[jpg jpg webp], variants.map { |v| v['format'] }
+    assert_equal 'https://static.example/s.webp', variants.last['url']
+  end
+
+  # Re-recording must replace, not accumulate: a post that loses a rendition
+  # upstream should not keep a stale row.
+  def test_variants_are_replaced_rather_than_accumulated
+    store = db
+    2.times do |n|
+      store.record_post(post_id: 7, refresh: true, variants: [
+                          { 'variant' => 'sample', 'format' => 'jpg', 'url' => "https://x/#{n}.jpg" }
+                        ])
+    end
+
+    assert_equal 1, store.post_variants(7).size
+    assert_equal 'https://x/1.jpg', store.post_variants(7).first['url']
+  end
+
+  # Child ids in site order, rather than only the count.
+  def test_children_are_recorded_in_order
+    store = db
+    store.record_post(post_id: 7, child_count: 2, children: [111, 222])
+
+    assert_equal [111, 222], store.post_children(7)
+    assert_equal 2, store.post(7)['child_count']
+  end
+
+  # A post with no children must clear a stale list, or a removed child would
+  # read as still linked forever.
+  def test_children_are_cleared_when_the_post_loses_them
+    store = db
+    store.record_post(post_id: 7, children: [111])
+    store.record_post(post_id: 7, refresh: true, children: [])
+
+    assert_empty store.post_children(7)
+  end
+
+  # Gelbooru's lifecycle and ownership words have no e621 equivalent but are the
+  # only record that a post was withdrawn upstream.
+  def test_gelbooru_lifecycle_fields_are_recorded
+    store = db(@path, site: 'gelbooru')
+    store.record_post(post_id: 9, status: 'active', creator_id: 55, creator_anonymous: false,
+                      num_notes: 2, is_held: false, is_pending: true)
+
+    row = store.post(9)
+    assert_equal 'active', row['status']
+    assert_equal 55, row['creator_id']
+    assert_equal 2, row['num_notes']
+    assert_equal 0, row['is_held']
+    assert_equal 1, row['is_pending']
+  end
+
   def test_post_detail_round_trips
     store = db
     store.record_post(

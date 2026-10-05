@@ -225,6 +225,127 @@ class PostMetadataTest < Minitest::Test
     assert_nil @e621.stored_post(1)
   end
 
+  # --- full capture --------------------------------------------------------
+
+  # Everything the site said is kept verbatim, so a field this schema has never
+  # heard of is still in the archive after e621 retires the endpoint.
+  def test_the_whole_response_is_kept_verbatim
+    @e621.record_post_metadata(E621_POST)
+
+    raw = @e621.send(:raw_post_json, E621_POST)
+    assert_equal E621_POST, JSON.parse(raw)
+    assert_equal E621_POST, @e621.db.raw_post(E621_POST['id'])
+  end
+
+  # rubichiver's own pool marker is bookkeeping, not part of the record, and it
+  # changes which directory the post lands in. It must not be stored as if the
+  # site had sent it.
+  def test_the_internal_pool_marker_is_not_stored_as_site_data
+    marked = E621_POST.merge(Archiver::POOL_MEMBER => 59203)
+
+    raw = JSON.parse(@e621.send(:raw_post_json, marked))
+
+    refute raw.key?('_pool_member')
+    assert raw.key?('id')
+  end
+
+  # Every rendition the site offers, one row each: the archive keeps only the
+  # original, but a sample or preview can be rebuilt from this later.
+  def test_every_rendition_offered_by_the_site_is_recorded
+    post = E621_POST.merge(
+      'files' => {
+        'meta' => { 'ext' => 'jpg', 'size' => 10 },
+        'original' => { 'width' => 1634, 'height' => 2000, 'url' => 'https://x/1.jpg' },
+        'sample' => { 'width' => 1200, 'height' => 850, 'jpg' => 'https://x/1s.jpg',
+                      'webp' => 'https://x/1s.webp' },
+        'preview' => { 'width' => 361, 'height' => 256, 'jpg' => 'https://x/1p.jpg' }
+      }
+    )
+    @e621.record_post_metadata(post)
+
+    variants = @e621.db.post_variants(post['id'])
+    assert_equal [%w[original jpg], %w[preview jpg], %w[sample jpg], %w[sample webp]],
+                 variants.map { |v| [v['variant'], v['format']] }
+    assert_equal 'https://x/1s.webp', variants.last['url']
+  end
+
+  # The variant geometry is queryable without parsing the blob.
+  def test_variant_geometry_is_recorded_as_columns
+    post = E621_POST.merge(
+      'files' => { 'meta' => { 'ext' => 'jpg' },
+                   'original' => { 'width' => 1634, 'height' => 2000, 'url' => 'https://x/1.jpg' },
+                   'sample' => { 'width' => 1200, 'height' => 850, 'jpg' => 'https://x/1s.jpg' },
+                   'preview' => { 'width' => 361, 'height' => 256, 'jpg' => 'https://x/1p.jpg' } }
+    )
+    @e621.record_post_metadata(post)
+
+    row = @e621.db.post(post['id'])
+    assert_equal [1200, 850, 361, 256],
+                 [row['sample_width'], row['sample_height'], row['preview_width'], row['preview_height']]
+  end
+
+  # Child ids, in site order, rather than only how many there are.
+  def test_children_are_recorded_by_id_and_in_order
+    post = E621_POST.merge('relationships' => { 'parent_id' => 5, 'children' => [111, 222, 333] })
+    @e621.record_post_metadata(post)
+
+    assert_equal [111, 222, 333], @e621.db.post_children(post['id'])
+    assert_equal 3, @e621.db.post(post['id'])['child_count']
+  end
+
+  # v1 nested whole post objects where v2 lists bare ids, so both are accepted
+  # rather than trusting one shape.
+  def test_children_are_read_from_either_response_shape
+    post = E621_POST.merge('relationships' => { 'children' => [{ 'id' => 111 }, 222] })
+    @e621.record_post_metadata(post)
+
+    assert_equal [111, 222], @e621.db.post_children(post['id'])
+  end
+
+  # The parts of stats that have no column of their own are still in stats_json,
+  # so hotness and a vote are recoverable.
+  def test_the_rest_of_the_stats_object_is_kept
+    post = E621_POST.merge('stats' => { 'score' => { 'total' => 60 }, 'hotness' => 4144.299,
+                                        'vote' => 1, 'is_favorited' => false })
+    @e621.record_post_metadata(post)
+
+    row = @e621.db.post(post['id'])
+    assert_equal 4144.299, row['hotness']
+    assert_equal 1, row['vote']
+    assert_equal 4144.299, row['stats']['hotness']
+  end
+
+  # Gelbooru's own lifecycle words: the only record that a post was withdrawn
+  # upstream once the bytes are archived.
+  def test_gelbooru_lifecycle_fields_are_recorded
+    post = GELBOORU_POST.merge('status' => 'active', 'creator_id' => '55',
+                               'creator_anonymous' => 'false', 'num_notes' => '2',
+                               'is_held' => 'false', 'is_pending' => 'true',
+                               'has_notes' => 'true')
+    @gelbooru.record_post_metadata(post)
+
+    row = @gelbooru.db.post(post['id'])
+    assert_equal 'active', row['status']
+    assert_equal 55, row['creator_id']
+    assert_equal 2, row['num_notes']
+    assert_equal 1, row['is_pending']
+    assert_equal 1, row['has_notes']
+  end
+
+  def test_gelbooru_file_variants_are_recorded
+    post = GELBOORU_POST.merge('sample_url' => 'https://x/5s.jpg', 'preview_url' => 'https://x/5p.jpg')
+    @gelbooru.record_post_metadata(post)
+
+    assert_equal %w[original preview sample], @gelbooru.db.post_variants(post['id']).map { |v| v['variant'] }
+    assert_equal 'https://x/5s.jpg', @gelbooru.db.post_variants(post['id']).last['url']
+  end
+
+  def test_gelbooru_response_is_kept_verbatim
+    @gelbooru.record_post_metadata(GELBOORU_POST)
+
+    assert_equal GELBOORU_POST, @gelbooru.db.raw_post(GELBOORU_POST['id'])
+  end
+
   # --- flat tag lists ------------------------------------------------------
 
   # mode=basic gives no categories. The sidecar is withheld rather than filled

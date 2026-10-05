@@ -139,12 +139,38 @@ sqlite3 /mnt/hdd/rubichiver-database.db \
 
 | Table | Contents |
 |-------|----------|
-| `posts` | One row per post: rating, dates, MD5, size, dimensions, duration, uploader, approver, description, page URL, score, favourites, comments, parent/children, flags, locked tags |
+| `posts` | One row per post: rating, dates, MD5, size, dimensions, duration, uploader, approver, description, page URL, score, favourites, comments, parent/children, flags, locked tags, capability flags, sample/preview geometry, and Gelbooru's lifecycle fields |
+| `post_raw` | The complete API response, verbatim, one row per post |
+| `post_files` | Every rendition the site offered — original, sample and preview, each with its format, dimensions and URL |
+| `post_children` | Child post ids, in the order the site listed them |
 | `tags` | One row per (post, category, tag) — indexed for tag lookup |
 | `post_sources` | The original source URLs, in order |
 | `pools`, `pool_posts` | e621 pools, their frozen directory slug, and membership |
 | `files` | Where each file lives, its MD5, size, dimensions, and whether its sidecar was current |
 | `tag_types` | Gelbooru tag category lookups, so they are resolved once rather than once per run |
+
+Everything the sites return is kept. The columns are a readable projection of
+`post_raw`, which holds the response exactly as it arrived — so a field this
+schema has never heard of is still in the archive, and the columns can be
+rebuilt from `post_raw` at any time. It is stored as its own row rather than a
+column on `posts` because `posts` is rewritten for every post rediscovered on
+every run, and re-serialising 2.8 KB of identical JSON tens of thousands of
+times is real work on a slow disk. A post's raw record is refreshed only by
+`--recache-post-tags`, so `post_raw.captured_at` doubles as a cheap "has this
+changed upstream?" check. Expect roughly 3 KB per post of extra storage; a
+full recache fills the new tables for every archived post.
+
+```bash
+# Every rendition of a post, without asking the site again
+sqlite3 /mnt/hdd/rubichiver-database.db \
+  "SELECT variant, format, width, height, url FROM post_files
+    WHERE site = 'e621' AND post_id = 4149486;"
+
+# A field no column models
+sqlite3 /mnt/hdd/rubichiver-database.db \
+  "SELECT json_extract(raw_json, '$.stats.hotness') FROM post_raw
+    WHERE site = 'e621' AND post_id = 4149486;"
+```
 
 Gelbooru's Unix upload timestamp is normalised to ISO UTC so date queries work
 across both sites; e621's original string is kept as given.

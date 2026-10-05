@@ -337,11 +337,72 @@ class E621Archiver < Archiver
       comment_count: post.dig('stats', 'comment_count'),
       parent_id: post.dig('relationships', 'parent_id'),
       child_count: Array(post.dig('relationships', 'children')).size,
+      children: child_ids(post),
       has_children: post.dig('has', 'children'),
+      has: post['has'],
       flags: post['flags'],
       stats: post['stats'],
-      locked_tags: post['locked_tags']
+      locked_tags: post['locked_tags'],
+      sample_width: post.dig('files', 'sample', 'width'),
+      sample_height: post.dig('files', 'sample', 'height'),
+      preview_width: post.dig('files', 'preview', 'width'),
+      preview_height: post.dig('files', 'preview', 'height'),
+      is_favorited: post.dig('stats', 'is_favorited'),
+      vote: post.dig('stats', 'vote'),
+      hotness: post.dig('stats', 'hotness'),
+      variants: file_variants(post),
+      raw_json: raw_post_json(post)
     )
+  end
+
+  # The whole response, stored verbatim so nothing the site sends is lost. The
+  # internal pool marker is dropped: it is rubichiver's own bookkeeping, not
+  # part of the record, and it changes which directory the post lands in.
+  def raw_post_json(post)
+    payload = post.reject { |key, _| key.start_with?('_') }
+    JSON.generate(payload)
+  rescue JSON::GeneratorError, SystemCallError
+    nil
+  end
+
+  # Every rendition on offer, flattened to one row each. The original has no
+  # per-format entry (its extension comes from files.meta.ext), while sample and
+  # preview are offered as jpg and/or webp.
+  def file_variants(post)
+    variants = []
+    files = post['files']
+    return variants unless files.is_a?(Hash)
+
+    original = files['original']
+    if original.is_a?(Hash)
+      variants << { 'variant' => 'original', 'format' => post.dig('files', 'meta', 'ext').to_s,
+                    'width' => original['width'], 'height' => original['height'],
+                    'url' => original['url'] }
+    end
+
+    %w[sample preview].each do |variant|
+      entry = files[variant]
+      next unless entry.is_a?(Hash)
+
+      # Whichever of jpg/webp the site lists for this variant; a variant may
+      # carry only one, or extra keys we do not model.
+      entry.each do |format, value|
+        next unless %w[jpg webp].include?(format.to_s)
+
+        variants << { 'variant' => variant, 'format' => format.to_s,
+                      'width' => entry['width'], 'height' => entry['height'],
+                      'url' => value.is_a?(String) ? value : value && value['url'] }
+      end
+    end
+    variants
+  end
+
+  # relationships.children is an array of ids in the v2 response. v1 nested
+  # whole post objects, so accept both rather than trusting the shape.
+  def child_ids(post)
+    Array(post.dig('relationships', 'children')).filter_map do |child|
+      child.is_a?(Hash) ? child['id'] : child
+    end
   end
 
   # Only reachable if the API answers mode=basic. Sidecar keywords are then

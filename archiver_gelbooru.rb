@@ -480,8 +480,43 @@ class GelbooruArchiver < Archiver
       score_down: post['down'],
       score_total: post['score'],
       comment_count: post['comments'],
-      fav_count: post['fav_count']
+      fav_count: post['fav_count'],
+      # status is Gelbooru's own lifecycle word (active/pending/deleted) and has
+      # no e621 equivalent, but it is the field that says whether a post is
+      # still live, so it is worth keeping under the shared name.
+      status: post['status'],
+      creator_id: post['creator_id'],
+      creator_anonymous: post['creator_anonymous'],
+      num_notes: post['num_notes'],
+      is_held: post['is_held'],
+      is_pending: post['is_pending'],
+      has_notes: post['has_notes'],
+      preview_width: post['preview_width'] || post['sample_width'],
+      sample_width: post['sample_width'],
+      sample_height: post['sample_height'],
+      raw_json: raw_post_json(post),
+      variants: file_variants(post)
     )
+  end
+
+  # The whole record, verbatim. Gelbooru posts arrive flat, so this is the
+  # only way fields rubichiver does not model are preserved.
+  def raw_post_json(post)
+    JSON.generate(post)
+  rescue JSON::GeneratorError, SystemCallError
+    nil
+  end
+
+  # Gelbooru serves the file at file_url and offers a sample and a preview as
+  # separate URLs, all named by the post's own extension.
+  def file_variants(post)
+    ext = post_file_ext(post)
+    { 'original' => post['file_url'], 'sample' => post['sample_url'], 'preview' => post['preview_url'] }
+      .filter_map do |variant, url|
+        next if url.to_s.empty?
+
+        { 'variant' => variant, 'format' => ext, 'width' => nil, 'height' => nil, 'url' => url }
+      end
   end
 
   def rating_value(rating)
