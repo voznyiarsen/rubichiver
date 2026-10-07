@@ -167,6 +167,20 @@ class RepairTest < Minitest::Test
     end
   end
 
+  def test_waiting_for_download_backoff_is_not_reported_as_a_disk_stall
+    @archiver.reset_progress
+    warnings = []
+    retry_only = Object.new
+    retry_only.define_singleton_method(:waiting_for_download_retry?) { true }
+    late = Process.clock_gettime(Process::CLOCK_MONOTONIC) + Archiver::STALL_WARN_SECONDS + 30
+
+    Rubichiver::Logger.stub(:warn, ->(message, _ctx = {}) { warnings << message }) do
+      assert_nil @archiver.check_for_stall(late, retry_only)
+    end
+
+    assert_empty warnings
+  end
+
   def test_a_making_progress_run_is_not_warned_about
     @archiver.reset_progress
     warnings = []

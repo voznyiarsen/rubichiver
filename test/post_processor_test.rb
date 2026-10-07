@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require_relative 'test_helper'
+require_relative 'support/stub_http'
 
 class PostProcessorUnitTest < Minitest::Test
   def setup
@@ -85,6 +86,131 @@ class PostProcessorUnitTest < Minitest::Test
       thread_count: 0,
       archiver: archiver
     )
+  end
+
+  # Each download_media call represents its three internal HTTP attempts.
+  # A failed round must yield to fresh work, and only the eventual result is
+  # counted; a recovered post is not a failed run.
+  def test_failed_download_goes_to_back_of_queue_then_succeeds
+    archiver = build_archiver(@dir)
+    attempts = []
+    archiver.define_singleton_method(:download_media) do |_url, path, id, _md5, thread_idx: nil|
+      attempts << id
+      next false if id == 1 && attempts.count(1) < 3
+
+      File.write(path, 'fake')
+      true
+    end
+    pp = processor(archiver, @stats)
+    pp.define_singleton_method(:retry_delay_for_round) { |_round| 0 }
+    pp.enqueue('id' => 1, 'image' => '1.png', 'file_url' => 'https://example.test/1.png')
+    pp.enqueue('id' => 2, 'image' => '2.png', 'file_url' => 'https://example.test/2.png')
+    pp.instance_variable_get(:@workers) << Thread.new { pp.send(:worker_loop, 0) }
+    pp.finish
+    pp.wait
+
+    assert_equal [1, 2, 1, 1], attempts
+    assert_equal 2, @stats.downloaded_files
+    assert_equal 0, @stats.failed_files
+    assert File.exist?(File.join(@dir, 'posts', '1.png'))
+  end
+
+  # Exercises the real download_media inner loop, not just a stub for one
+  # round: six transient HTTP failures followed by a good transfer means seven
+  # requests across three rounds, with no final failure counted.
+  def test_retries_do_not_expand_pools_again_or_reclaim_the_location
+    archiver = build_archiver(@dir)
+    expansions = 0
+    archiver.define_singleton_method(:expand_pools) do |*_args, **_kwargs|
+      expansions += 1
+    end
+    attempts = 0
+    archiver.define_singleton_method(:download_media) do |_url, path, _id, _md5, thread_idx: nil|
+      attempts += 1
+      next false if attempts == 1
+
+      File.write(path, 'fake')
+      true
+    end
+    pp = processor(archiver, @stats)
+    pp.define_singleton_method(:retry_delay_for_round) { |_round| 0 }
+    pp.enqueue('id' => 6, 'image' => '6.png', 'file_url' => 'https://example.test/6.png')
+    pp.instance_variable_get(:@workers) << Thread.new { pp.send(:worker_loop, 0) }
+    pp.finish
+    pp.wait
+
+    assert_equal 1, expansions
+    assert_equal 2, attempts
+    assert_equal 1, @stats.downloaded_files
+  end
+
+  def test_real_download_retries_three_times_per_round
+    archiver = build_archiver(@dir)
+    archiver.ensure_rate_limiter
+    archiver.define_singleton_method(:retry_delay) { |_retries| 0 }
+    real_download = Archiver.instance_method(:download_media)
+    archiver.define_singleton_method(:download_media) do |*args, **kwargs|
+      real_download.bind_call(self, *args, **kwargs)
+    end
+    attempts = 0
+    archiver.define_singleton_method(:http_get) do |_uri, **_kwargs, &body_handler|
+      attempts += 1
+      raise EOFError, 'truncated download' if attempts <= 6
+
+      body_handler.call(StubHttp::Response.new(200, 'fake'))
+    end
+    pp = processor(archiver, @stats)
+    pp.define_singleton_method(:retry_delay_for_round) { |_round| 0 }
+    pp.enqueue('id' => 5, 'image' => '5.png', 'file_url' => 'https://example.test/5.png')
+    pp.instance_variable_get(:@workers) << Thread.new { pp.send(:worker_loop, 0) }
+    pp.finish
+    pp.wait
+
+    assert_equal 7, attempts
+    assert_equal 1, @stats.downloaded_files
+    assert_equal 0, @stats.failed_files
+  end
+
+  def test_download_counts_as_failure_only_after_all_ten_rounds
+    archiver = build_archiver(@dir)
+    attempts = 0
+    archiver.define_singleton_method(:download_media) do |*_args, thread_idx: nil|
+      attempts += 1
+      false
+    end
+    pp = processor(archiver, @stats)
+    pp.define_singleton_method(:retry_delay_for_round) { |_round| 0 }
+    pp.enqueue('id' => 3, 'image' => '3.png', 'file_url' => 'https://example.test/3.png')
+    pp.instance_variable_get(:@workers) << Thread.new { pp.send(:worker_loop, 0) }
+    pp.finish
+    pp.wait
+
+    assert_equal 10, attempts # download_media itself makes 3 HTTP tries/round
+    assert_equal 1, @stats.failed_files
+    assert_equal 0, @stats.downloaded_files
+  end
+
+  def test_interrupt_does_not_wait_for_deferred_backoff
+    archiver = build_archiver(@dir)
+    attempted = Queue.new
+    archiver.define_singleton_method(:download_media) do |*_args, thread_idx: nil|
+      attempted << true
+      false
+    end
+    pp = processor(archiver, @stats)
+    pp.define_singleton_method(:retry_delay_for_round) { |_round| 3600 }
+    pp.enqueue('id' => 4, 'image' => '4.png', 'file_url' => 'https://example.test/4.png')
+    pp.instance_variable_get(:@workers) << Thread.new { pp.send(:worker_loop, 0) }
+    pp.finish
+    require 'timeout'
+    Timeout.timeout(5) do
+      attempted.pop
+      archiver.instance_variable_set(:@interrupted, true)
+      pp.wait
+    end
+
+    assert_equal 1, @stats.skipped_files
+    assert_equal 0, @stats.failed_files
   end
 
   def test_output_file_uses_served_extension

@@ -301,7 +301,7 @@ class Archiver
       archiver: self
     )
 
-    watchdog = start_stall_watchdog
+    watchdog = start_stall_watchdog(processor)
 
     if @recache_post_tags
       log_info "Recache mode — refreshing stored metadata for all existing posts"
@@ -337,12 +337,12 @@ class Archiver
   # thing this tool does — walking the archive, reading and rewriting tens of
   # thousands of sidecars — can block on the disk for a very long time with no
   # output, and there is no other way to tell that apart from a hang.
-  def start_stall_watchdog
+  def start_stall_watchdog(processor = nil)
     reset_progress
     Thread.new do
       loop do
         sleep 30
-        check_for_stall
+        check_for_stall(Process.clock_gettime(Process::CLOCK_MONOTONIC), processor)
       end
     end
   end
@@ -354,8 +354,16 @@ class Archiver
   end
 
   # Separated from the polling thread so it can be exercised directly.
-  def check_for_stall(now = Process.clock_gettime(Process::CLOCK_MONOTONIC))
+  def check_for_stall(now = Process.clock_gettime(Process::CLOCK_MONOTONIC), processor = nil)
     return nil unless @progress_mutex
+
+    # A run whose only remaining work is timed download retries is intentionally
+    # idle. Reporting that as a wedged disk would be a false alarm. Still warn
+    # when a worker is active but stopped making progress.
+    if processor&.waiting_for_download_retry?
+      @progress_mutex.synchronize { @progress_at = now }
+      return nil
+    end
 
     idle = @progress_mutex.synchronize do
       [now - @progress_at, @progress_count]
@@ -1021,7 +1029,11 @@ class Archiver
         log_error "MD5 mismatch for post #{post_id} (expected #{expected_md5}, got #{digest.hexdigest})",
                   post_id: post_id, thread: thread_idx, api: true
       else
-        log_warn "Download failed for post #{post_id} (HTTP #{status})",
+        # A 200 only means the headers arrived. A broken TLS connection or a
+        # truncated body can still fail the transfer after that point; calling
+        # this an "HTTP 200 failure" hides the actual transport fault above.
+        reason = status.to_i == 200 ? 'response body incomplete' : "HTTP #{status}"
+        log_warn "Download failed for post #{post_id} (#{reason})",
                  post_id: post_id, status: status, thread: thread_idx, api: true
       end
 

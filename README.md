@@ -352,9 +352,15 @@ passes can never drive the database at once.
   directions at once is still written exactly once.
 - A cross-host redirect is followed without the API key: credentials are only
   sent to the host they were minted for.
-- Any fault during a download costs a retry, and any fault a worker cannot
-  anticipate is counted as a reported failure — a run never reports success
-  while having quietly dropped a post.
+- A download gets three immediate HTTP attempts per round. If all three fail,
+  its location goes to the **back of the work queue** for another round while
+  other posts continue. There are ten rounds (up to 30 HTTP attempts), with
+  30–300 seconds of backoff between rounds; after the tenth, it is counted as
+  one failed post. Sidecar failures and API search failures are separate and
+  are not retried by this download queue. A graceful interrupt cancels
+  deferred retries promptly. Any fault a worker cannot anticipate is counted
+  as a reported failure — a run never reports success while having quietly
+  dropped a post.
 - One archiver at a time on a single spinning disk. Two runs sharing the database
   saturate it and both stall; the archive database is built for concurrency, but
   the disk under it may not be.

@@ -43,9 +43,28 @@ class PostProcessor
   # Upper bound on how long an idle worker sleeps before rechecking the stop
   # condition, in case a wakeup is missed.
   IDLE_POLL_SECONDS = 0.25
+  # A download gets MAX_RETRIES back-to-back attempts (one round), then goes
+  # to the back of the queue and tries again later. Rounds times attempts is
+  # the total budget per post: 10 x 3 = ~30.
+  MAX_ROUNDS = 10
+  # Seconds to wait before each later round. Indexed by completed rounds, so
+  # the first retry waits 30s and a stubborn post waits up to 5 minutes between
+  # rounds. Worst case added latency is ~31 minutes, and only workers with
+  # nothing else to do sit it out — everyone else keeps draining the queue.
+  ROUND_DELAYS = [30, 60, 120, 180, 300, 300, 300, 300, 300].freeze
+  # A retry carries the original claimed location and round number; it is not
+  # an API post and is never persisted as site data.
+  RetryWork = Struct.new(:post, :location, :served_ext, :orig_ext, :file_url, :round)
+  # Cap on a dequeue wait so an interrupt is honoured promptly even when the
+  # only outstanding work is deferred retries due minutes out.
+  DEFER_WAIT_CAP = 1.0
 
   def initialize(rate_limiter:, output_dir:, stats:, thread_count: 4, dry_run: false, archiver: nil)
     @queue = Queue.new
+    # Posts whose download round failed and are waiting out their backoff.
+    # Entries are [due_monotonic, RetryWork]; each stays counted in @pending
+    # while deferred, so workers cannot exit with retries outstanding.
+    @deferred = []
     @rate_limiter = rate_limiter
     @output_dir = output_dir
     @stats = stats
@@ -91,19 +110,74 @@ class PostProcessor
     log_info "Skipped #{@interrupt_skipped} posts due to interrupt" if @interrupt_skipped > 0
   end
 
+  # Waiting for a backoff is intentional, not a disk stall. The watchdog can
+  # suppress its warning only when *all* outstanding work is deferred; a stuck
+  # download worker must still be reported.
+  def waiting_for_download_retry?
+    @pending_mutex.synchronize do
+      @finishing && @queue.empty? && !@deferred.empty? && @pending == @deferred.size
+    end
+  end
+
   private
 
   # Blocks until an item is available, or returns nil once the run is finishing
-  # and nothing is outstanding.
+  # and nothing is outstanding. Retries whose backoff has elapsed rejoin the
+  # back of the queue; ones still waiting keep the worker parked without
+  # spinning, and an interrupt drains them immediately so shutdown never hangs
+  # on a backoff.
   def dequeue
     @pending_mutex.synchronize do
       loop do
-        return @queue.pop(true) unless @queue.empty?
+        release_due_retries
+        unless @queue.empty?
+          return @queue.pop(true)
+        end
         return nil if @finishing && @pending.zero?
 
-        @work_available.wait(@pending_mutex, IDLE_POLL_SECONDS)
+        if !@deferred.empty? && @archiver&.interrupted
+          @deferred.each { |(_, post)| @queue << post }
+          @deferred.clear
+          @work_available.broadcast
+          next
+        end
+
+        wait_for = deferred_wait
+        if wait_for
+          @work_available.wait(@pending_mutex, wait_for)
+        else
+          @work_available.wait(@pending_mutex, IDLE_POLL_SECONDS)
+        end
       end
     end
+  end
+
+  # Moves retries whose backoff has elapsed to the back of the queue, behind
+  # every post that has not been tried yet.
+  def release_due_retries
+    return if @deferred.empty?
+
+    now = monotonic_now
+    due, later = @deferred.partition { |(due_at, _)| due_at <= now }
+    return if due.empty?
+
+    @deferred.replace(later)
+    due.each { |(_, post)| @queue << post }
+    @work_available.broadcast
+  end
+
+  # How long to park when the only outstanding work is backing off, capped so
+  # an interrupt is honoured promptly. Nil when ordinary work may still arrive.
+  def deferred_wait
+    return nil if @deferred.empty?
+
+    wait_for = @deferred.map(&:first).min - monotonic_now
+    wait_for = 0 if wait_for.negative?
+    [wait_for, DEFER_WAIT_CAP].min
+  end
+
+  def monotonic_now
+    Process.clock_gettime(Process::CLOCK_MONOTONIC)
   end
 
   def complete_one
@@ -119,7 +193,11 @@ class PostProcessor
       break if post.nil?
 
       begin
-        process_post(post, idx)
+        if post.is_a?(RetryWork)
+          process_retry(post, idx)
+        else
+          process_post(post, idx)
+        end
       rescue => e
         # An unexpected fault must be a *reported* failure. Swallowing it here
         # dropped the post entirely while the run still exited 0, which is the
@@ -131,6 +209,37 @@ class PostProcessor
         complete_one
       end
     end
+  end
+
+  # The original location claim remains held across rounds, so another worker
+  # cannot race the same .part file. Neither pool expansion nor discovery is
+  # repeated for a retry; only this location's failed download is retried.
+  def process_retry(work, thread_idx)
+    if @archiver.interrupted
+      @interrupt_mutex.synchronize { @interrupt_skipped += 1 }
+      @stats.increment(:skipped_files)
+      return
+    end
+
+    place_post(work.post, work.location, work.served_ext, work.orig_ext,
+               work.file_url, thread_idx, round: work.round)
+  end
+
+  def retry_delay_for_round(completed_round)
+    ROUND_DELAYS.fetch(completed_round - 1)
+  end
+
+  def defer_download(post, location, served_ext, orig_ext, file_url, round)
+    delay = retry_delay_for_round(round)
+    work = RetryWork.new(post, location, served_ext, orig_ext, file_url, round + 1)
+    @pending_mutex.synchronize do
+      @pending += 1
+      @deferred << [monotonic_now + delay, work]
+      @work_available.broadcast
+    end
+    log_warn "Post #{post['id']} download failed after #{round * Archiver::MAX_RETRIES} attempts; " \
+             "requeued for round #{round + 1}/#{MAX_ROUNDS} in #{delay}s",
+             post_id: post['id'], round: round, delay: delay
   end
 
   def claim(post_id, location)
@@ -187,7 +296,7 @@ class PostProcessor
     end
   end
 
-  def place_post(post, location, served_ext, orig_ext, file_url, thread_idx)
+  def place_post(post, location, served_ext, orig_ext, file_url, thread_idx, round: 1)
     post_id = post['id']
 
     FileUtils.mkdir_p(location.directory) unless Dir.exist?(location.directory)
@@ -219,8 +328,17 @@ class PostProcessor
     md5 = served_ext == orig_ext ? @archiver.post_md5(post) : nil
 
     unless @archiver.download_media(file_url, output_file, post_id, md5, thread_idx: thread_idx)
-      log_error "Thread #{thread_idx}: Post #{post_id} download failed", post_id: post_id, thread: thread_idx
-      @stats.increment(:failed_files)
+      if @archiver.interrupted
+        @interrupt_mutex.synchronize { @interrupt_skipped += 1 }
+        @stats.increment(:skipped_files)
+      elsif round < MAX_ROUNDS
+        defer_download(post, location, served_ext, orig_ext, file_url, round)
+      else
+        log_error "Thread #{thread_idx}: Post #{post_id} download failed after " \
+                  "#{round * Archiver::MAX_RETRIES} attempts (#{MAX_ROUNDS} rounds)",
+                  post_id: post_id, thread: thread_idx
+        @stats.increment(:failed_files)
+      end
       return
     end
 
