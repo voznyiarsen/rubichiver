@@ -159,7 +159,7 @@ class Archiver
   attr_accessor :username, :api_key, :output_dir, :cache_dir, :tags_file, :credentials_file,
                 :blacklist_file, :dry_run, :thread_count, :rate_limit,
                 :rate_limiter, :blacklist, :existing_posts, :interrupted, :verbose,
-                :notify_url, :user_id, :db, :pools_enabled, :repair_missing
+                :notify_url, :user_id, :db, :pools_enabled, :repair_missing, :retry_failed
 
   def initialize(username: nil, api_key: nil, user_id: nil, output_dir: nil,
                  cache_dir: nil, db_path: nil,
@@ -168,7 +168,7 @@ class Archiver
                  thread_count: 2, rate_limit: DEFAULT_REQUESTS_PER_SECOND, verbose: false,
                  interrupted: false, rate_limiter: nil, notify_url: nil,
                  recache_post_tags: false, pools: true, verify_md5: false,
-                 cache_max_age: CACHE_MAX_AGE_DAYS, repair_missing: true)
+                 cache_max_age: CACHE_MAX_AGE_DAYS, repair_missing: true, retry_failed: false)
     @username = username
     @api_key = api_key
     @user_id = user_id
@@ -193,12 +193,15 @@ class Archiver
     @verify_md5 = verify_md5
     @cache_max_age = cache_max_age
     @repair_missing = repair_missing
+    @retry_failed = retry_failed
     @repaired_sidecars = 0
     @integrity_faults = Hash.new(0)
     @sidecar_index = nil
     @lock_file = nil
     @pool_claims = Set.new
     @pool_claim_mutex = Mutex.new
+    @download_errors = {}
+    @download_error_mutex = Mutex.new
     @pools_expanded = 0
     @pools_expanded_mutex = Mutex.new
     # The media index and the per-post reverse map are read by every worker and
@@ -243,6 +246,12 @@ class Archiver
   # Whether a sidecar with no media beside it is re-fetched by id at startup.
   def repair_missing?
     @repair_missing
+  end
+
+  # Whether downloads that exhausted every round are looked up by id and tried
+  # again. Off unless asked: it costs an id lookup per recorded failure.
+  def retry_failed?
+    @retry_failed
   end
 
   def run
@@ -316,6 +325,7 @@ class Archiver
 
       repair_sidecars_from_db(stats)
       repair_missing_media(processor, stats)
+      retry_failed_downloads(processor, stats)
       process_tag_queries(processor, stats)
     end
 
@@ -971,6 +981,22 @@ class Archiver
     nil
   end
 
+  # Remembers why a post's latest download round failed, so the final
+  # exhaustion can record something more useful than "it failed". Keyed by post
+  # because four workers fail independently; entries are deleted on success and
+  # when the failure is recorded, so only in-flight failures occupy memory.
+  def remember_download_error(post_id, message)
+    @download_error_mutex.synchronize { @download_errors[post_id] = message }
+  end
+
+  def download_error_for(post_id)
+    @download_error_mutex.synchronize { @download_errors.delete(post_id) }
+  end
+
+  def forget_download_error(post_id)
+    @download_error_mutex.synchronize { @download_errors.delete(post_id) }
+  end
+
   # Streams url to output_file, verifying MD5 when the site supplies one.
   # Partial downloads live in a .part file and are always cleaned up, so an
   # interrupted run never leaves something that looks like a finished file.
@@ -1002,10 +1028,12 @@ class Archiver
         # are the commonest failure of all; they must cost a retry, not the post.
         log_warn "Network error downloading post #{post_id} (attempt #{retries + 1}/#{MAX_RETRIES}): #{e.message}",
                  post_id: post_id, thread: thread_idx, api: true
+        remember_download_error(post_id, e.message)
         written = false
       rescue StandardError => e
         log_warn "Download of post #{post_id} failed (attempt #{retries + 1}/#{MAX_RETRIES}): #{e.class}: #{e.message}",
                  post_id: post_id, thread: thread_idx, api: true
+        remember_download_error(post_id, "#{e.class}: #{e.message}")
         written = false
       end
 
@@ -1018,16 +1046,20 @@ class Archiver
           # --verify-md5, one more unverified file on every run.
           remember_downloaded_digest(output_file, digest.hexdigest)
           log_debug "Post #{post_id}: no MD5 to verify against", post_id: post_id, thread: thread_idx, api: true
+          forget_download_error(post_id)
           return true
         end
 
         if digest.hexdigest == expected_md5
           File.rename(tmp_file, output_file)
+          forget_download_error(post_id)
           return true
         end
 
-        log_error "MD5 mismatch for post #{post_id} (expected #{expected_md5}, got #{digest.hexdigest})",
+        mismatch = "MD5 mismatch (expected #{expected_md5}, got #{digest.hexdigest})"
+        log_error "#{mismatch} for post #{post_id}",
                   post_id: post_id, thread: thread_idx, api: true
+        remember_download_error(post_id, mismatch)
       else
         # A 200 only means the headers arrived. A broken TLS connection or a
         # truncated body can still fail the transfer after that point; calling
@@ -1035,6 +1067,7 @@ class Archiver
         reason = status.to_i == 200 ? 'response body incomplete' : "HTTP #{status}"
         log_warn "Download failed for post #{post_id} (#{reason})",
                  post_id: post_id, status: status, thread: thread_idx, api: true
+        remember_download_error(post_id, reason)
       end
 
       File.delete(tmp_file) if File.exist?(tmp_file)
@@ -1541,6 +1574,43 @@ class Archiver
     end
   end
 
+  # Downloads that burned through every round on an earlier run. Asked for by
+  # id, like orphans: nothing else would ever revisit them unless some tag
+  # query happened to return them again. A post the site no longer returns is
+  # dropped as gone upstream rather than retried forever.
+  def retry_failed_downloads(processor, stats)
+    return unless retry_failed?
+    return unless @db.enabled?
+
+    ids = @db.failed_download_ids
+    if ids.empty?
+      log_info "No failed downloads waiting for a retry"
+      return
+    end
+
+    log_warn "#{ids.size} failed download(s) queued for another try; fetching them by id",
+             count: ids.size, posts: ids.first(10).join(',')
+    result = fetch_posts_by_ids(ids)
+    unless result.ok?
+      log_error "Could not look up the failed downloads", count: ids.size
+      return
+    end
+
+    found_ids = result.posts.compact.filter_map { |post| post['id'] }
+    (ids - found_ids).each do |gone_id|
+      log_warn "Post #{gone_id} is no longer returned by the site; dropping it from the retry list",
+               post_id: gone_id
+      @db.clear_download_failure(gone_id)
+    end
+
+    result.posts.compact.each do |post|
+      next unless post['files'] || post_file_url(post)
+
+      stats.increment(:total_posts)
+      processor.enqueue(post)
+    end
+  end
+
   # Ids that have a sidecar next to nothing, across posts/ and every bundle
   # directory.
   def sidecars_without_media
@@ -1718,6 +1788,10 @@ class Archiver
   def record_archived_file(post, location, path, md5: nil, sidecar: nil)
     remember_existing(post['id'], location, path)
     return unless @db.enabled?
+
+    # A file that finally landed resolves any earlier recorded failure for the
+    # post, whether this run placed it fresh or found it already archived.
+    @db.clear_download_failure(post['id'])
 
     # A container variant is verified against nothing, so take the digest the
     # download already produced rather than leaving the row unverifiable.

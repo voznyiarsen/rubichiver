@@ -347,6 +347,34 @@ class ArchiveDbTest < Minitest::Test
     store.close
   end
 
+  # Downloads that exhausted every round are recorded for --retry-failed,
+  # oldest failure first.
+  def test_download_failures_round_trip
+    store = db
+    store.record_download_failure(7, attempts: 30, error: 'Connection reset by peer')
+    store.record_download_failure(8, attempts: 30, error: 'response body incomplete')
+
+    assert_equal [7, 8], store.failed_download_ids
+    assert_equal 2, store.failed_download_count
+    store.clear_download_failure(7)
+
+    assert_equal [8], store.failed_download_ids
+    assert_equal 1, store.failed_download_count
+  end
+
+  # A post that keeps failing keeps its latest timestamp, attempt count and
+  # error rather than accumulating rows.
+  def test_recording_a_failure_twice_keeps_the_latest
+    store = db
+    store.record_download_failure(7, attempts: 30, error: 'reset')
+    store.record_download_failure(7, attempts: 30, error: 'eof')
+
+    assert_equal [7], store.failed_download_ids
+    row = store.send(:select_one, 'SELECT error FROM download_failures WHERE site = ? AND post_id = ?',
+                     ['e621', 7])
+    assert_equal 'eof', row['error']
+  end
+
   def test_tag_types_persist_between_opens
     store = db
     store.remember_tag_types('cat' => 'general', 'sukiya' => 'artist')

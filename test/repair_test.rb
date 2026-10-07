@@ -149,8 +149,82 @@ class RepairTest < Minitest::Test
     assert_equal 0, stats.failed_files
   end
 
-  # --- the stall watchdog ---------------------------------------------------
+  # --- retrying exhausted downloads -----------------------------------------
 
+  def retry_archiver
+    retrying = E621Archiver.new(output_dir: @dir, db_path: @db_path, username: 't', api_key: 'k',
+                                rate_limit: 1000, retry_failed: true)
+    retrying.ensure_rate_limiter
+    retrying.define_singleton_method(:download_media) do |_url, output, _id, _md5, thread_idx: nil|
+      File.binwrite(output, 'fetched')
+      true
+    end
+    retrying.define_singleton_method(:write_sidecar) { |_m, _p| true }
+    retrying
+  end
+
+  def test_retry_failed_requeues_recorded_failures_and_drops_gone_posts
+    retrying = retry_archiver
+    retrying.db.record_download_failure(111, attempts: 30, error: 'reset')
+    retrying.db.record_download_failure(222, attempts: 30, error: 'reset')
+    asked = nil
+    found = post(111)
+    retrying.define_singleton_method(:fetch_posts_by_ids) do |ids|
+      asked = ids
+      Archiver::ApiResult.new([found], 1, nil)
+    end
+
+    stats = Stats.new
+    processor = PostProcessor.new(rate_limiter: retrying.rate_limiter, output_dir: @dir,
+                                  stats: stats, thread_count: 1, archiver: retrying)
+    retrying.retry_failed_downloads(processor, stats)
+    processor.finish
+    processor.wait
+
+    assert_equal [111, 222], asked
+    assert File.exist?(File.join(@dir, 'posts', '111.png')), 'the found post is fetched again'
+    assert_empty retrying.db.failed_download_ids, 'recovered and gone posts leave the retry list'
+    assert_equal 1, stats.total_posts
+    assert_equal 1, stats.downloaded_files
+    assert_equal 0, stats.failed_files
+  end
+
+  def test_retry_failed_is_off_unless_asked
+    @archiver.db.record_download_failure(111, attempts: 30, error: 'reset')
+    asked = false
+    @archiver.define_singleton_method(:fetch_posts_by_ids) do |_ids|
+      asked = true
+      Archiver::ApiResult.new([], 0, nil)
+    end
+
+    stats = Stats.new
+    processor = PostProcessor.new(rate_limiter: @archiver.rate_limiter, output_dir: @dir,
+                                  stats: stats, thread_count: 0, archiver: @archiver)
+    @archiver.retry_failed_downloads(processor, stats)
+
+    refute asked, 'no id lookup happens without the flag'
+    assert_equal [111], @archiver.db.failed_download_ids
+    assert_equal 0, stats.total_posts
+  end
+
+  def test_retry_failed_with_an_empty_list_does_nothing
+    retrying = retry_archiver
+    asked = false
+    retrying.define_singleton_method(:fetch_posts_by_ids) do |_ids|
+      asked = true
+      Archiver::ApiResult.new([], 0, nil)
+    end
+
+    stats = Stats.new
+    processor = PostProcessor.new(rate_limiter: retrying.rate_limiter, output_dir: @dir,
+                                  stats: stats, thread_count: 0, archiver: retrying)
+    retrying.retry_failed_downloads(processor, stats)
+
+    refute asked
+    assert_equal 0, stats.total_posts
+  end
+
+  # --- the stall watchdog ---------------------------------------------------
   # A wedged run looks exactly like a slow one from outside, and burning hours
   # silently is the worst outcome, so the run has to say something.
   def test_a_stalled_run_says_so

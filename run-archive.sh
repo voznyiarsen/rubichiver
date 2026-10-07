@@ -37,9 +37,13 @@ run_site() {
   # "is rate limiting this run", the run will back itself off to 1 req/s per
   # worker and then to 1 req/s in total, and will push an alert to ntfy.
   # See https://e621.net/help/api.
+  # --retry-failed costs one id lookup per post that exhausted every round on
+  # an earlier run (usually zero rows), so failed downloads heal themselves
+  # the following week instead of waiting for a tag query to return them.
   ruby rubichiver.rb \
     -j 4 \
     --rate-limit 8 \
+    --retry-failed \
     -b "${CONFIG_DIR}/blacklist.txt" \
     -C "${CACHE_DIR}" \
     -s "${site}" \

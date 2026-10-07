@@ -294,6 +294,36 @@ class ArchiveDb
                [@site, post_id])&.fetch('n', 0).to_i
   end
 
+  # Records a download that exhausted every retry round. Upserted: a post that
+  # keeps failing keeps its latest timestamp, attempt count and error.
+  def record_download_failure(post_id, attempts:, error: nil)
+    return unless connected?
+
+    run('INSERT INTO download_failures (site, post_id, failed_at, attempts, error) ' \
+        'VALUES (?,?,?,?,?) ON CONFLICT(site, post_id) DO UPDATE SET ' \
+        'failed_at = excluded.failed_at, attempts = excluded.attempts, error = excluded.error',
+        [@site, post_id, Time.now.utc.iso8601, attempts, error])
+  end
+
+  # A post that finally archived is no failure. Called on every successful
+  # placement, so a recovered post cannot linger in the retry list.
+  def clear_download_failure(post_id)
+    return unless connected?
+
+    run('DELETE FROM download_failures WHERE site = ? AND post_id = ?', [@site, post_id])
+  end
+
+  # Ids still waiting for a retry, oldest failure first.
+  def failed_download_ids
+    select('SELECT post_id FROM download_failures WHERE site = ? ORDER BY failed_at',
+           [@site]).map { |row| row['post_id'] }
+  end
+
+  def failed_download_count
+    select_one('SELECT COUNT(*) AS n FROM download_failures WHERE site = ?',
+               [@site])&.fetch('n', 0).to_i
+  end
+
   def pool_member_ids(pool_id)
     select('SELECT post_id FROM pool_posts WHERE site = ? AND pool_id = ? ORDER BY post_id',
            [@site, pool_id]).map { |row| row['post_id'] }
@@ -1059,6 +1089,19 @@ class ArchiveDb
       kind  TEXT    NOT NULL,
       value INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (site, kind)
+    ) WITHOUT ROWID;
+
+    -- Downloads that burned through every retry round. Repaired by rerunning
+    -- with --retry-failed, which asks the site for these ids directly; a post
+    -- the site no longer returns is dropped as gone upstream, and a post that
+    -- finally archives clears its row on success.
+    CREATE TABLE IF NOT EXISTS download_failures (
+      site      TEXT    NOT NULL,
+      post_id   INTEGER NOT NULL,
+      failed_at TEXT    NOT NULL,
+      attempts  INTEGER NOT NULL DEFAULT 0,
+      error     TEXT,
+      PRIMARY KEY (site, post_id)
     ) WITHOUT ROWID;
   SQL
 

@@ -144,6 +144,49 @@ class PostProcessorUnitTest < Minitest::Test
     assert_equal 1, @stats.downloaded_files
   end
 
+  # Exhaustion records attempts and the last error for --retry-failed, so the
+  # failure survives the run instead of dying with it.
+  def test_an_exhausted_download_is_recorded_for_retry_failed
+    archiver = TestArchiver.new(output_dir: @dir, db_path: File.join(@dir, 'db'),
+                                username: 'tester', api_key: 'key', rate_limit: 1000)
+    archiver.instance_variable_set(:@downloaded, [])
+    archiver.define_singleton_method(:download_media) do |*_args, **_kwargs|
+      remember_download_error(10, 'Connection reset by peer')
+      false
+    end
+    pp = processor(archiver, @stats)
+    pp.define_singleton_method(:retry_delay_for_round) { |_round| 0 }
+    pp.enqueue('id' => 10, 'image' => '10.png', 'file_url' => 'https://example.test/10.png')
+    pp.instance_variable_get(:@workers) << Thread.new { pp.send(:worker_loop, 0) }
+    pp.finish
+    pp.wait
+
+    assert_equal [10], archiver.db.failed_download_ids
+    row = archiver.db.send(:select_one,
+                           'SELECT attempts, error FROM download_failures WHERE site = ? AND post_id = ?',
+                           %w[test 10])
+    assert_equal 30, row['attempts']
+    assert_equal 'Connection reset by peer', row['error']
+    assert_equal 1, @stats.failed_files
+  end
+
+  # A post that finally archives clears its earlier failure row, whether the
+  # file was downloaded now or found already archived.
+  def test_a_recovered_post_clears_its_recorded_failure
+    archiver = TestArchiver.new(output_dir: @dir, db_path: File.join(@dir, 'db'),
+                                username: 'tester', api_key: 'key', rate_limit: 1000)
+    archiver.instance_variable_set(:@downloaded, [])
+    archiver.db.record_download_failure(11, attempts: 30, error: 'reset')
+    pp = processor(archiver, @stats)
+    pp.enqueue('id' => 11, 'image' => '11.png', 'file_url' => 'https://example.test/11.png')
+    pp.instance_variable_get(:@workers) << Thread.new { pp.send(:worker_loop, 0) }
+    pp.finish
+    pp.wait
+
+    assert_empty archiver.db.failed_download_ids
+    assert_equal 1, @stats.downloaded_files
+  end
+
   def test_real_download_retries_three_times_per_round
     archiver = build_archiver(@dir)
     archiver.ensure_rate_limiter

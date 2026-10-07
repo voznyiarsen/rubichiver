@@ -47,6 +47,7 @@ Run `ruby rubichiver.rb --help` for the authoritative list.
 | `--recache-post-tags` | Refresh the stored metadata of every archived post and regenerate any missing or drifted sidecar. No downloads |
 | `--[no-]pools` | Bundle a whole pool when a found post belongs to one (e621, default on) |
 | `--[no-]repair-missing` | Re-fetch posts that have a sidecar but no media file (default on) |
+| `--retry-failed` | Look up recorded download failures by id and try them again (also on in the weekly script) |
 | `--verify-md5` | Re-hash archived files against the database on startup (slow) |
 | `--cache-max-age DAYS` | Drop cached API pages older than DAYS (default: 90, 0 disables) |
 | `--notify URL` | POST JSON report to webhook on completion |
@@ -151,6 +152,7 @@ sqlite3 /mnt/hdd/rubichiver-database.db \
 | `files` | Where each file lives, its MD5, size, dimensions, and whether its sidecar was current |
 | `tag_types` | Gelbooru tag category lookups, so they are resolved once rather than once per run |
 | `counters` | Cached per-site post and tag counts, so the summary never runs `COUNT(*)` over millions of rows |
+| `download_failures` | Downloads that exhausted every round, with attempt count and last error — drained by `--retry-failed` |
 
 Everything the sites return is kept. The columns are a readable projection of
 `post_raw`, which holds the response exactly as it arrived — so a field this
@@ -350,6 +352,11 @@ passes can never drive the database at once.
   bulk id lookup, so it costs one request per archived post.
 - A post is placed once per location, so a bundle that is reached from several
   directions at once is still written exactly once.
+- A download that exhausts all ten rounds is recorded in the database, not just
+  the log. `--retry-failed` looks those ids up directly and tries them again; a
+  post the site no longer returns is dropped as gone upstream, and a post that
+  finally archives clears its row on success — so one bad night never needs a
+  tag query to return the post before it heals.
 - A cross-host redirect is followed without the API key: credentials are only
   sent to the host they were minted for.
 - A download gets three immediate HTTP attempts per round. If all three fail,

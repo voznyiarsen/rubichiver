@@ -93,6 +93,11 @@ if __FILE__ == $PROGRAM_NAME
             'Re-fetch posts that have a sidecar but no media file (default on)') do |value|
       options[:repair_missing] = value
     end
+    opts.on('--retry-failed',
+            'Look up downloads that exhausted every retry round by id and try them again ' \
+            '(posts the site no longer returns are dropped from the retry list)') do
+      options[:retry_failed] = true
+    end
     opts.on('--verify-md5', 'Re-hash archived files against the database on startup (slow)') do
       options[:verify_md5] = true
     end
@@ -175,6 +180,7 @@ if __FILE__ == $PROGRAM_NAME
     db_path: options[:db_path],
     pools: options[:pools],
     repair_missing: options[:repair_missing],
+    retry_failed: options[:retry_failed],
     verify_md5: options[:verify_md5],
     recache_post_tags: options[:recache_post_tags],
     cache_max_age: options[:cache_max_age]

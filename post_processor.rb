@@ -334,9 +334,12 @@ class PostProcessor
       elsif round < MAX_ROUNDS
         defer_download(post, location, served_ext, orig_ext, file_url, round)
       else
+        attempts = round * Archiver::MAX_RETRIES
         log_error "Thread #{thread_idx}: Post #{post_id} download failed after " \
-                  "#{round * Archiver::MAX_RETRIES} attempts (#{MAX_ROUNDS} rounds)",
+                  "#{attempts} attempts (#{MAX_ROUNDS} rounds); recorded for --retry-failed",
                   post_id: post_id, thread: thread_idx
+        @archiver.db.record_download_failure(post_id, attempts: attempts,
+                                                       error: @archiver.download_error_for(post_id))
         @stats.increment(:failed_files)
       end
       return
@@ -364,12 +367,14 @@ class PostProcessor
   end
 
   # An already-archived post is only touched when its sidecar has drifted from
-  # what the post currently says.
+  # what the post currently says. Either way the file is verified present, so
+  # any earlier recorded download failure for the post is resolved.
   def refresh_sidecar(existing, post, location, thread_idx)
     post_id = post['id']
 
     if @archiver.sidecar_valid?(post, location)
       log_info "Thread #{thread_idx}: Post #{post_id} sidecar valid, skipping", post_id: post_id, thread: thread_idx
+      @archiver.db.clear_download_failure(post_id)
       @stats.increment(:skipped_files)
       return
     end
@@ -381,6 +386,7 @@ class PostProcessor
     case result
     when true
       @archiver.record_sidecar_written(post, location, existing)
+      @archiver.db.clear_download_failure(post_id)
       log_info "Thread #{thread_idx}: Post #{post_id} sidecar regenerated successfully",
                post_id: post_id, thread: thread_idx
       @stats.increment(:autotagged_files)
