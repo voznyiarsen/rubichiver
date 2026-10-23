@@ -64,6 +64,11 @@ class ArchiveDb
   # Tags are inserted in one statement per chunk rather than one per tag: a post
   # carries dozens, and 40x fewer statements is 40x less work per post.
   TAG_INSERT_CHUNK = 200
+  # How many posts a bulk read covers. Big enough that the number of queries
+  # is small, small enough that the rows for one chunk fit comfortably in
+  # memory: a post carries dozens of tags, and this many of them is a few
+  # megabytes.
+  DETAIL_QUERY_CHUNK = 500
 
   attr_reader :path
 
@@ -80,6 +85,8 @@ class ArchiveDb
     @batch_statements = 0
     @batch_started_at = nil
     @tag_types = nil
+    @files_cache = nil
+    @post_exts = nil
   end
 
   def enabled?
@@ -146,8 +153,84 @@ class ArchiveDb
     row && file_row(row)
   end
 
+  # The archived files, read once and kept.
+  #
+  # The table holds tens of thousands of rows and a full scan of it costs
+  # around a minute on a spinning disk, and the startup pass needs it three
+  # times over: to reconcile the store against the filesystem, to check the
+  # archived bytes for damage, and to find the sidecars that no longer agree
+  # with the record. The cache is kept up to date by the writes below, so it
+  # never has to be thrown away.
   def files
-    select(FILE_SELECT.to_s + ' WHERE site = ?', [@site]).map { |row| file_row(row) }
+    load_files_cache unless @files_cache
+    @files_cache.values
+  end
+
+  # The extension the site advertises for every post, read in one pass.
+  # The integrity check needs this for each archived file, and asking per file
+  # turns a single scan into tens of thousands of point queries.
+  def post_exts
+    @post_exts ||= select('SELECT post_id, ext FROM posts WHERE site = ?', [@site])
+                    .to_h { |row| [row['post_id'], row['ext']] }
+  end
+
+  # Everything the store knows about a set of posts, read in bulk.
+  #
+  # A sidecar is compared against the stored record, which means the post's
+  # tags, sources and pools. Asking for those one post at a time is three
+  # round trips per post -- tens of thousands of them for a large archive --
+  # when a handful of chunked queries would do.
+  #
+  # @param post_ids [Array<Integer>] the posts to load
+  # @return [Hash] post_id => { 'record' => row, 'tags' => {...}, 'sources' => [...],
+  #   'pools' => [...] }
+  def stored_details(post_ids)
+    ids = post_ids.map(&:to_i).uniq
+    return {} if ids.empty?
+
+    details = {}
+    ids.each_slice(DETAIL_QUERY_CHUNK) do |chunk|
+      placeholders = Array.new(chunk.size, '?').join(',')
+      binds = [@site] + chunk
+
+      select("SELECT * FROM posts WHERE site = ? AND post_id IN (#{placeholders})", binds).each do |row|
+        details[row['post_id']] ||= { 'record' => post_row(row), 'tags' => {}, 'sources' => [], 'pools' => [] }
+      end
+
+      select("SELECT post_id, category, tag FROM tags WHERE site = ? AND post_id IN (#{placeholders})",
+             binds).each do |row|
+        entry = details[row['post_id']]
+        next unless entry
+
+        (entry['tags'][row['category']] ||= []) << row['tag']
+      end
+
+      select("SELECT post_id, ordinal, url FROM post_sources WHERE site = ? AND post_id IN (#{placeholders})",
+             binds).each do |row|
+        entry = details[row['post_id']]
+        next unless entry
+
+        # The order the site listed them in is kept: the sources end up in the
+        # sidecar, and a sidecar that lists them in a different order than the
+        # post does is a sidecar that never settles.
+        entry['sources'] << [row['ordinal'], row['url']]
+      end
+
+      select("SELECT post_id, pool_id FROM pool_posts WHERE site = ? AND post_id IN (#{placeholders})",
+             binds).each do |row|
+        entry = details[row['post_id']]
+        next unless entry
+
+        entry['pools'] << row['pool_id']
+      end
+    end
+
+    details.each_value do |entry|
+      entry['tags'].each_value(&:sort!)
+      entry['sources'] = entry['sources'].sort_by(&:first).map(&:last)
+      entry['pools'].sort!
+    end
+    details
   end
 
   def post(post_id)
@@ -355,11 +438,15 @@ class ArchiveDb
                   bytes: nil, sidecar: false, rating: nil, width: nil, height: nil)
     return unless connected?
 
+    archived_at = Time.now.utc.iso8601
     run("INSERT OR REPLACE INTO files " \
         '(site, post_id, pool_id, path, dir, md5, ext, bytes, sidecar, rating, width, height, archived_at) ' \
         'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)',
         [@site, post_id, pool_key(pool_id), path, dir, md5, ext, bytes, sidecar ? 1 : 0, rating, width, height,
-         Time.now.utc.iso8601])
+         archived_at])
+    remember_file(post_id, pool_id, path: path, dir: dir, md5: md5, ext: ext, bytes: bytes,
+                                sidecar: sidecar, rating: rating, width: width, height: height,
+                                archived_at: archived_at)
   end
 
   # Small standalone update so a sidecar refresh does not have to rewrite the
@@ -369,12 +456,15 @@ class ArchiveDb
 
     run('UPDATE files SET sidecar = ? WHERE site = ? AND post_id = ? AND pool_id = ?',
         [sidecar ? 1 : 0, @site, post_id, pool_key(pool_id)])
+    entry = @files_cache && @files_cache[[post_id, pool_key(pool_id)]]
+    entry['sidecar'] = sidecar ? 1 : 0 if entry
   end
 
   def forget_file(post_id, pool_id = nil)
     return unless connected?
 
     run('DELETE FROM files WHERE site = ? AND post_id = ? AND pool_id = ?', [@site, post_id, pool_key(pool_id)])
+    @files_cache&.delete([post_id, pool_key(pool_id)])
   end
 
   # Points every root file row at the posts/ subdirectory after a layout
@@ -383,12 +473,20 @@ class ArchiveDb
   def relocate_root_files(posts_dir)
     return 0 unless connected?
 
+    updated = 0
     @lock.synchronize do
       @conn.execute("UPDATE files SET dir = ?, path = ? || '/' || path " \
                     'WHERE site = ? AND dir = ?',
                     [posts_dir, posts_dir, @site, '.'])
-      @conn.changes
+      updated = @conn.changes
     end
+    @files_cache&.each_value do |entry|
+      next unless entry['dir'] == '.'
+
+      entry['dir'] = posts_dir
+      entry['path'] = "#{posts_dir}/#{entry['path']}"
+    end
+    updated
   end
 
   def record_pool(id:, name:, slug:, post_count: nil, active: nil)
@@ -484,6 +582,9 @@ class ArchiveDb
           "VALUES (#{Array.new(POST_COLUMNS.size, '?').join(',')})",
           POST_COLUMNS.map { |column| values[column] })
       bump_counter('posts', 1) if is_new
+      # The extension the site advertises can change, so the bulk copy of them
+      # is no longer trustworthy.
+      @post_exts = nil
 
       # A new post has no rows to delete, so skip that read; a recache passes
       # refresh: true and goes through the counted path inside.
@@ -638,6 +739,33 @@ class ArchiveDb
       'width' => row['width'], 'height' => row['height'], 'archived_at' => row['archived_at'] }
   end
 
+  # Reads the file rows into the cache, keyed by post and pool.
+  #
+  # The cache is assigned only once the rows are in hand: the read may open the
+  # store for the first time, and opening it clears the cache.
+  def load_files_cache
+    cache = {}
+    select(FILE_SELECT.to_s + ' WHERE site = ?', [@site]).each do |row|
+      entry = file_row(row)
+      cache[[entry['post'], pool_key(entry['pool'])]] = entry
+    end
+    @files_cache = cache
+  end
+
+  # Keeps the cache in step with a file that was just written.
+  def remember_file(post_id, pool_id, path:, dir:, md5:, ext:, bytes:, sidecar:, rating:, width:, height:,
+                    archived_at:)
+    return unless @files_cache
+
+    @files_cache[[post_id, pool_key(pool_id)]] = {
+      'site' => @site, 'post' => post_id,
+      'pool' => pool_id.nil? ? nil : pool_id,
+      'path' => path, 'dir' => dir, 'md5' => md5, 'ext' => ext, 'bytes' => bytes,
+      'sidecar' => sidecar ? 1 : 0, 'rating' => rating, 'width' => width, 'height' => height,
+      'archived_at' => archived_at
+    }
+  end
+
   def post_row(row)
     row = row.dup
     %w[flags_json stats_json locked_tags has_json].each do |key|
@@ -651,14 +779,29 @@ class ArchiveDb
     old_count = tag_count_for_post(post_id) if old_count.nil?
     run('DELETE FROM tags WHERE site = ? AND post_id = ?', [@site, post_id])
     inserted = 0
+    rows = []
     tags.each do |category, names|
       Array(names).each do |tag|
-        run('INSERT OR IGNORE INTO tags (site, post_id, category, tag) VALUES (?,?,?,?)',
-                   [@site, post_id, category.to_s, tag.to_s])
+        rows << [@site, post_id, category.to_s, tag.to_s]
         inserted += 1
       end
     end
+    insert_tag_rows(rows)
     bump_counter('tags', inserted - old_count)
+  end
+
+  # A post carries dozens of tags, and a statement per tag is a statement per
+  # tag for the whole archive: five million of them on a run that rediscovers
+  # every post. The rows go in as one multi-row insert instead, chunked so the
+  # bind variables stay well under SQLite's limit.
+  def insert_tag_rows(rows)
+    return if rows.empty?
+
+    rows.each_slice(TAG_INSERT_CHUNK) do |chunk|
+      placeholders = Array.new(chunk.size, '(?,?,?,?)').join(',')
+      run("INSERT OR IGNORE INTO tags (site, post_id, category, tag) VALUES #{placeholders}",
+          chunk.flatten)
+    end
   end
 
   def replace_sources(post_id, sources)
@@ -867,6 +1010,8 @@ class ArchiveDb
     create_schema!
     backfill_counters!
     @tag_types = nil
+    @files_cache = nil
+    @post_exts = nil
   end
 
   def configure!

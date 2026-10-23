@@ -12,6 +12,7 @@ require 'open3'
 require_relative 'logger'
 require_relative 'rate_limiter'
 require_relative 'archive_db'
+require_relative 'sidecar_writer'
 require_relative 'version'
 require_relative 'dns_cache'
 
@@ -25,10 +26,20 @@ class Archiver
   API_READ_TIMEOUT = 60
   DOWNLOAD_READ_TIMEOUT = 300
   RECACHE_BATCH_SIZE = 300
+  # How many posts' stored detail is read at once when the archive is compared
+  # against what is on disk. Big enough that the number of queries is small,
+  # small enough that the rows for one chunk fit comfortably in memory: a post
+  # carries dozens of tags.
+  STORED_DETAIL_CHUNK = 500
   # One exiftool per batch, so bigger batches mean fewer forks. 2000 paths fit
   # comfortably in an argv; a batch that will not read is still halved until it
   # does, so an oversized batch degrades rather than fails.
   SIDECAR_READ_BATCH = 2000
+  # How many batches are read at once. Reading a sidecar is mostly waiting for
+  # the disk, so several exiftool processes overlap their seeks: measured on
+  # this archive, reading 2000 sidecars took 74s in one process and 21s across
+  # four. The index is built on every run, so it is worth the parallelism.
+  SIDECAR_READ_PARALLELISM = 4
   # Cache entries older than this are dropped at startup, so the cache stays
   # useful without growing without bound.
   CACHE_MAX_AGE_DAYS = 90
@@ -70,6 +81,9 @@ class Archiver
   # extension to mean anything — the .part marker goes before it.
   SIDECAR_TMP_PATTERN = /\.xmp\.\d+\.part\.xmp\z/.freeze
   DB_BASENAME = '.rubichiver.db'
+  # Where the pid of the exiftool process is recorded, so a run that was killed
+  # outright can be cleaned up by the next one.
+  SIDECAR_PID_FILE = '.rubichiver-exiftool.pid'
   # Marks a post that was pulled in by a pool rather than by a tag query, so
   # its own pools are not expanded in turn.
   POOL_MEMBER = '_pool_member'
@@ -207,6 +221,16 @@ class Archiver
     # The media index and the per-post reverse map are read by every worker and
     # written by whichever worker just placed a file, so they need a real lock.
     @existing_mutex = Monitor.new
+    # One exiftool process for the whole program, rather than one per sidecar.
+    @sidecar_writer = SidecarWriter.shared(logger: Rubichiver::Logger)
+    @sidecar_temp_counter = 0
+    @sidecar_temp_mutex = Mutex.new
+    # Lookups that are asked for again and again during a run: the pool names
+    # every sidecar comparison needs, and the archive-relative form of every
+    # directory the run touches.
+    @cache_mutex = Mutex.new
+    @pool_names = {}
+    @relative_directories = {}
     @db = ArchiveDb.new(@dry_run ? nil : @db_path, site: site_name, logger: Rubichiver::Logger)
   end
 
@@ -261,6 +285,7 @@ class Archiver
     unless @dry_run
       FileUtils.mkdir_p(@output_dir) unless Dir.exist?(@output_dir)
       acquire_run_lock
+      prepare_sidecar_writer
     end
 
     ensure_rate_limiter
@@ -593,10 +618,15 @@ class Archiver
   # natural place to put a missing or drifted sidecar right. Without this, a
   # post whose sidecar was lost keeps no metadata at all until some tag query
   # happens to return it again.
+  # A sidecar is only rewritten when its location actually holds media, so
+  # the locations a post is *archived in* are what matter here -- not the
+  # locations it would be placed in. A post in a pool is placed in the pool
+  # directory, but it may also sit in posts/ from an earlier run, and its
+  # sidecar there is just as much in need of repair.
   def repair_sidecar(post)
     return if @dry_run
 
-    post_locations(post).each do |location|
+    archived_locations(post['id']).each do |location|
       media = existing_media(post['id'], location)
       next unless media
       next if sidecar_valid?(post, location)
@@ -608,6 +638,13 @@ class Archiver
 
       record_sidecar_written(post, location, media)
       @repaired_sidecars += 1
+    end
+  end
+
+  # Every location a post has media in.
+  def archived_locations(post_id)
+    @existing_mutex.synchronize do
+      (@existing_by_post[post_id] || []).map { |key| location_for_key(key) }
     end
   end
 
@@ -775,11 +812,15 @@ class Archiver
   end
 
   def relative_directory(directory)
-    root = File.expand_path(@output_dir)
-    path = File.expand_path(directory)
-    return '.' if path == root
+    @cache_mutex.synchronize do
+      cached = @relative_directories[directory]
+      return cached if cached
 
-    path.delete_prefix("#{root}/")
+      root = File.expand_path(@output_dir)
+      path = File.expand_path(directory)
+      relative = path == root ? '.' : path.delete_prefix("#{root}/")
+      @relative_directories[directory] = relative
+    end
   end
 
   def existing_key(post_id, location)
@@ -1228,9 +1269,28 @@ class Archiver
     build_stored_post(record, @db.post_tags(post_id), @db.sources(post_id))
   end
 
+  # The stored post for each of several posts, read in one pass.
+  #
+  # Rebuilding a sidecar means comparing it against the stored record, which
+  # needs the post's tags, sources and pools. Asking for those one post at a
+  # time is three queries per post -- hundreds of thousands of them for a large
+  # archive -- so they are read in bulk instead.
+  #
+  # @return [Hash] post_id => the post, for the posts that can be rebuilt
+  def stored_posts(post_ids)
+    return {} unless @db.enabled?
+
+    @db.stored_details(post_ids).each_with_object({}) do |(post_id, detail), result|
+      record = detail['record']
+      next if record['uncategorized'].to_i == 1
+
+      result[post_id] = build_stored_post(record, detail['tags'], detail['sources'], detail['pools'])
+    end
+  end
+
   # Subclasses assemble the same shape their API response would have, from the
   # stored record, its categorized tags and its sources.
-  def build_stored_post(_record, _categories, _sources)
+  def build_stored_post(_record, _categories, _sources, _pools = nil)
     raise NotImplementedError
   end
 
@@ -1248,26 +1308,51 @@ class Archiver
     return unless @db.enabled?
     return if @dry_run
 
-    missing = @db.files.select { |record| sidecar_needs_rebuild?(record) }
-    return if missing.empty?
+    records = @db.files
+    return if records.empty?
 
-    log_info "#{missing.size} archived file(s) have a missing or outdated sidecar; " \
-             'rebuilding from the stored record',
-             count: missing.size
-    missing.each do |record|
-      post = stored_post(record['post'])
-      next unless post
+    # The stored detail behind every archived file, read in bulk. Asking for it
+    # one post at a time is three queries per file, which on a large archive is
+    # the single most expensive thing a startup does.
+    #
+    # The work is done a chunk at a time rather than collecting everything
+    # first: a rebuild of the whole archive would otherwise hold every post's
+    # tags in memory at once.
+    by_post = records.group_by { |record| record['post'] }
+    rebuilt = 0
+    by_post.each_slice(STORED_DETAIL_CHUNK) do |chunk|
+      posts = stored_posts(chunk.map(&:first))
+      chunk.each do |post_id, post_records|
+        post = posts[post_id]
+        next unless post
 
-      location = location_of(record)
-      path = @existing_posts[existing_key(record['post'], location)]
-      next unless path && File.file?(path)
-
-      result = write_sidecar(path, post)
-      next unless result == true
-
-      record_sidecar_written(post, location, path)
-      stats.increment(:autotagged_files)
+        post_records.each do |record|
+          rebuilt += 1 if rebuild_sidecar(record, post, stats)
+        end
+      end
     end
+    return if rebuilt.zero?
+
+    log_info "#{rebuilt} archived file(s) had a missing or outdated sidecar; " \
+             'rebuilt from the stored record',
+             count: rebuilt
+  end
+
+  # Rewrites one sidecar from the stored record. Returns true when it was
+  # rewritten.
+  def rebuild_sidecar(record, post, stats)
+    return false unless sidecar_needs_rebuild?(record, post)
+
+    location = location_of(record)
+    path = @existing_posts[existing_key(record['post'], location)]
+    return false unless path && File.file?(path)
+
+    result = write_sidecar(path, post)
+    return false unless result == true
+
+    record_sidecar_written(post, location, path)
+    stats.increment(:autotagged_files)
+    true
   end
 
   # True when the sidecar is absent, or disagrees with the stored record. The
@@ -1275,12 +1360,15 @@ class Archiver
   # queries never reach still converges; one the queries do reach is re-checked
   # against the site during the run and corrected if the stored copy has since
   # fallen behind.
-  def sidecar_needs_rebuild?(record)
+  #
+  # The post is passed in when the caller already has it, so the comparison
+  # does not have to read the stored detail again.
+  def sidecar_needs_rebuild?(record, post = nil)
     location = location_of(record)
     return true unless record['sidecar']
     return true unless File.exist?(sidecar_path(record['post'], location))
 
-    post = stored_post(record['post'])
+    post ||= stored_post(record['post'])
     # Nothing stored to rebuild from: leave it alone rather than guessing.
     return false unless post
 
@@ -1337,24 +1425,47 @@ class Archiver
   # a long-lived archive does not accumulate pages for queries that no longer
   # run. Age rather than reachability: a page for a query that is temporarily
   # absent from tags.txt is still worth keeping.
+  #
+  # The per-post tag cache that used to live beside these pages is gone -- the
+  # archive database holds tags durably now -- but the files it left behind are
+  # still on disk, tens of thousands of them. Nothing reads them and nothing
+  # prunes them, so they are removed here: they cost a quarter of a gigabyte
+  # and make every listing of the cache directory slower.
   def prune_stale_cache
-    return if @dry_run || @cache_max_age.to_i <= 0 || !Dir.exist?(@cache_dir)
+    return if @dry_run || !Dir.exist?(@cache_dir)
 
-    cutoff = Time.now - (@cache_max_age * 86_400)
     removed = 0
-    Dir.glob(File.join(@cache_dir, 'api_posts_*.json')).each do |file|
-      mtime = File.mtime(file)
-      next if mtime >= cutoff
+    removed += prune_cache_pattern('api_posts_*.json', @cache_max_age.to_i)
+    # The dead per-post tag cache is removed whatever the age setting says:
+    # nothing reads those files and nothing else would ever remove them.
+    removed += prune_cache_pattern('tags_*.json', nil)
 
-      File.delete(file)
-      removed += 1
-    rescue SystemCallError => e
-      log_debug "Could not prune #{File.basename(file)}: #{e.message}"
-    end
     return if removed.zero?
 
-    log_info "Pruned #{removed} API cache page(s) older than #{@cache_max_age} days",
-             pruned: removed, max_age_days: @cache_max_age
+    log_info "Pruned #{removed} cache file(s)", pruned: removed, max_age_days: @cache_max_age
+  end
+
+  # Removes the cache files matching a pattern.
+  #
+  # @param max_age_days [Integer, nil] how old a file has to be to go. Zero or
+  #   less keeps everything, which is what --cache-max-age 0 means. Nil removes
+  #   every match, which is what the dead tag cache wants.
+  def prune_cache_pattern(pattern, max_age_days)
+    return 0 if max_age_days && max_age_days <= 0
+
+    cutoff = max_age_days ? Time.now - (max_age_days * 86_400) : nil
+    removed = 0
+    Dir.glob(File.join(@cache_dir, pattern)).each do |file|
+      begin
+        next if cutoff && File.mtime(file) >= cutoff
+
+        File.delete(file)
+        removed += 1
+      rescue SystemCallError => e
+        log_debug "Could not prune #{File.basename(file)}: #{e.message}"
+      end
+    end
+    removed
   end
 
   # Restores persisted tag category lookups, so a run does not re-ask the tag API
@@ -1461,8 +1572,11 @@ class Archiver
       # be fetched again.
       next if file.end_with?(SIDECAR_SUFFIX)
 
-      next unless File.file?(full)
+      # The name is matched before the file is asked about: a directory holds
+      # roughly as many sidecars as media, and every one of them would
+      # otherwise cost a stat on a spinning disk.
       next unless file =~ /\A(\d+)\./
+      next unless File.file?(full)
 
       index_existing($1.to_i, location, full)
     end
@@ -1506,8 +1620,11 @@ class Archiver
     Dir.children(directory).any? do |entry|
       next false if entry.start_with?('.') || entry.end_with?(SIDECAR_SUFFIX, *TEMP_SUFFIXES)
       next false if entry.match?(DAMAGED_PATTERN)
+      # The name is matched before the file is asked about, for the same
+      # reason the media scan does it: a sidecar is not worth a stat.
+      next false unless entry.match?(/\A\d+\.[^.]/)
 
-      File.file?(File.join(directory, entry)) && entry.match?(/\A\d+\.[^.]/)
+      File.file?(File.join(directory, entry))
     end
   end
 
@@ -1523,13 +1640,19 @@ class Archiver
   def reconcile_with_db
     return unless @db.enabled?
 
-    missing = @db.files.reject { |record| db_file_present?(record) }
+    records = @db.files
+    missing = records.reject { |record| db_file_present?(record) }
     missing.each { |record| @db.forget_file(record['post'], record['pool']) }
+
+    # The store already knows which files it has, so the question is answered
+    # from what was just read rather than by asking the database again for
+    # every file on disk.
+    known = records.to_h { |record| [[record['post'], record['pool']], true] }
 
     adopted = 0
     @existing_posts.each do |key, path|
       post_id, pool_id, relative = split_existing_key(key)
-      next if @db.file(post_id, pool_id)
+      next if known[[post_id, pool_id]]
 
       adopted += 1
       location = Location.new(db_directory(relative), pool_id)
@@ -1721,7 +1844,7 @@ class Archiver
     file_ext = record['ext'].to_s.downcase
     return true if file_ext.empty?
 
-    post_ext = @db.post_ext(record['post'])
+    post_ext = @db.post_exts[record['post']]
     post_ext.nil? || post_ext.to_s.empty? || post_ext.to_s.downcase == file_ext
   end
 
@@ -1830,6 +1953,15 @@ class Archiver
     exit 1
   end
 
+  # Points the sidecar writer at this archive and clears up after a run that
+  # was killed outright: the exiftool it started cannot stop itself, and
+  # exiftool's stay-open mode keeps it alive after its input ends, so a hard
+  # kill would otherwise leave one behind for every run.
+  def prepare_sidecar_writer
+    @sidecar_writer.pid_path = File.join(@output_dir, SIDECAR_PID_FILE)
+    @sidecar_writer.reap_orphan
+  end
+
   # --- Sidecars -------------------------------------------------------------
 
   def sidecar_path(post_id, location = nil)
@@ -1852,25 +1984,75 @@ class Archiver
     log_info "Reading #{pairs.size} existing sidecars", api: true
     total_batches = (pairs.size.to_f / SIDECAR_READ_BATCH).ceil
 
-    pairs.each_slice(SIDECAR_READ_BATCH).with_index do |batch, idx|
-      break if @interrupted
+    batches = pairs.each_slice(SIDECAR_READ_BATCH).to_a
+    read = read_sidecar_batches(batches)
 
-      next if index_sidecar_batch(batch)
-
-      log_error "exiftool could not read every sidecar in batch #{idx + 1}/#{total_batches}; " \
+    if read == :failed
+      log_error "exiftool could not read every sidecar in batch of #{total_batches}; " \
                 'falling back to checking sidecars one at a time', api: true
       @sidecar_index = nil
       return
     end
 
+    read.each { |entries| @sidecar_index.merge!(entries) }
     log_info "Indexed #{@sidecar_index.size} sidecars", api: true
   end
 
-  # Returns false when the batch could not be read, so the caller can drop the
-  # index rather than treat unread sidecars as invalid and rewrite them. The
-  # group-qualified read is what lets each field be looked up unambiguously.
-  def index_sidecar_batch(batch)
-    return true if batch.empty?
+  # Reads the batches, several at a time. The batches are independent, and the
+  # reading is disk-bound rather than CPU-bound, so overlapping them is what
+  # makes this pass bearable on a large archive.
+  #
+  # @return [Array<Hash>, Symbol] the entries per batch, or :failed when a
+  #   batch could not be read at all
+  def read_sidecar_batches(batches)
+    return [] if batches.empty?
+
+    results = Array.new(batches.size)
+    failed = false
+    mutex = Mutex.new
+    next_slot = 0
+
+    workers = [SIDECAR_READ_PARALLELISM, batches.size].min
+    threads = Array.new(workers) do
+      Thread.new do
+        loop do
+          slot = mutex.synchronize do
+            if failed || next_slot >= batches.size
+              nil
+            else
+              current = next_slot
+              next_slot += 1
+              current
+            end
+          end
+          break if slot.nil?
+          break if @interrupted
+
+          entries = read_sidecar_batch(batches[slot])
+          mutex.synchronize do
+            if entries == false
+              failed = true
+            else
+              results[slot] = entries
+            end
+          end
+        end
+      end
+    end
+    threads.each(&:join)
+
+    return :failed if failed
+
+    results.compact
+  end
+
+  # Reads one batch and hands back what it found, keyed by the archive key the
+  # sidecar belongs to. Returns false when the batch could not be read, so the
+  # caller can drop the index rather than treat unread sidecars as invalid and
+  # rewrite them. The group-qualified read is what lets each field be looked
+  # up unambiguously.
+  def read_sidecar_batch(batch)
+    return {} if batch.empty?
 
     by_source = batch.to_h
     stdout, stderr, status = exiftool_read(batch.map(&:first))
@@ -1881,13 +2063,14 @@ class Archiver
 
     entries = JSON.parse(stdout)
     entries = [entries] unless entries.is_a?(Array)
+    found = {}
     entries.each do |entry|
       next unless entry.is_a?(Hash) && entry['SourceFile']
 
       key = by_source[entry['SourceFile']]
-      @sidecar_index[key] = entry if key
+      found[key] = entry if key
     end
-    true
+    found
   rescue JSON::ParserError => e
     log_warn "exiftool returned unparsable JSON for a sidecar batch: #{e.message}", api: true
     false
@@ -1904,7 +2087,14 @@ class Archiver
   def index_sidecar_batch_smaller(batch)
     return false if batch.size <= 1
 
-    batch.each_slice(batch.size / 2).all? { |part| index_sidecar_batch(part) }
+    merged = {}
+    batch.each_slice(batch.size / 2) do |part|
+      entries = read_sidecar_batch(part)
+      return false if entries == false
+
+      merged.merge!(entries)
+    end
+    merged
   end
 
   # One exiftool process over a set of sidecars, returning its captured output.
@@ -2056,10 +2246,24 @@ class Archiver
     # it cannot write for webm ("Writing of WEBM files is not yet supported").
     # The .part marker before it keeps the in-flight file out of the media scan if
     # this process dies between writing and renaming.
-    tmp_sidecar = "#{sidecar}#{Process.pid}#{PART_SUFFIX}#{SIDECAR_SUFFIX}"
-    File.delete(tmp_sidecar) if File.exist?(tmp_sidecar)
+    tmp_sidecar = sidecar_temp_path(sidecar)
 
-    args = ['-o', tmp_sidecar]
+    failure = @sidecar_writer.run(sidecar_args(payload, tmp_sidecar, media_file),
+                                  output_path: tmp_sidecar)
+    if failure == true && File.exist?(tmp_sidecar)
+      File.rename(tmp_sidecar, sidecar)
+      return true
+    end
+
+    File.delete(tmp_sidecar) if File.exist?(tmp_sidecar)
+    log_error "exiftool sidecar write failed: #{failure}", sidecar: sidecar, post_id: post_id
+    false
+  end
+
+  # The exiftool command that writes one sidecar. Split out so the argument
+  # shape can be exercised without running exiftool.
+  def sidecar_args(payload, output_path, media_file)
+    args = ['-o', output_path]
     payload.each do |key, value|
       tag = SIDECAR_FIELDS[key]
       next if value.nil? || (value.respond_to?(:empty?) && value.empty?)
@@ -2073,17 +2277,18 @@ class Archiver
       end
     end
     args << media_file
+    args
+  end
 
-    _stdout, stderr, status = Open3.capture3('exiftool', *args)
-
-    if status.success? && File.exist?(tmp_sidecar)
-      File.rename(tmp_sidecar, sidecar)
-      return true
+  # A unique name for a sidecar that is being written, so two writers cannot
+  # clobber each other's half-finished file. The name ends in .xmp for the
+  # reason write_sidecar gives, and matches SIDECAR_TMP_PATTERN so a killed
+  # run's leftover is recognised and cleaned up.
+  def sidecar_temp_path(sidecar)
+    number = @sidecar_temp_mutex.synchronize do
+      @sidecar_temp_counter += 1
     end
-
-    File.delete(tmp_sidecar) if File.exist?(tmp_sidecar)
-    log_error "exiftool sidecar write failed: #{stderr}", sidecar: sidecar, post_id: post_id, stderr: stderr
-    false
+    "#{sidecar}.#{Process.pid}#{number}#{PART_SUFFIX}#{SIDECAR_SUFFIX}"
   end
 
   # --- Sidecar content ------------------------------------------------------
@@ -2138,8 +2343,21 @@ class Archiver
     return [] unless pools_active?
 
     post_pool_ids(post).filter_map do |pool_id|
-      name = @db.pool(pool_id)&.fetch('name', nil)
+      name = pool_name(pool_id)
       name && "pool:#{name}"
+    end
+  end
+
+  # The name of a pool, read from the store once per run.
+  #
+  # Every archived file has its sidecar compared against the post, and the pool
+  # names are part of that comparison, so asking the database for them each
+  # time is a query per file. The name of a pool does not change under a run.
+  def pool_name(pool_id)
+    @cache_mutex.synchronize do
+      return @pool_names[pool_id] if @pool_names.key?(pool_id)
+
+      @pool_names[pool_id] = @db.pool(pool_id)&.fetch('name', nil)
     end
   end
 

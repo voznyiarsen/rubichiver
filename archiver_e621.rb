@@ -302,11 +302,12 @@ class E621Archiver < Archiver
     post.dig('files', 'original', 'width') || post.dig('files', 'sample', 'width')
   end
 
-  def build_stored_post(record, categories, sources)
+  def build_stored_post(record, categories, sources, pools = nil)
+    pools ||= @db.post_pools(record['post_id'])
     { 'id' => record['post_id'], 'rating' => record['rating'],
       'created_at' => record['created_at'], 'updated_at' => record['updated_at'],
       'description' => record['description'], 'sources' => sources,
-      'pools' => @db.post_pools(record['post_id']).map { |id| { 'id' => id } },
+      'pools' => pools.map { |id| { 'id' => id } },
       'tags' => categories }
   end
 

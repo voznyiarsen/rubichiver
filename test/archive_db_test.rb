@@ -9,7 +9,11 @@ class ArchiveDbTest < Minitest::Test
   end
 
   def teardown
-    FileUtils.remove_entry(@dir)
+    # The store is often left open, and SQLite removes its write-ahead log
+    # files when the last connection goes away -- which can happen while the
+    # directory is being emptied. The removal is forced so that race does not
+    # fail a test that passed.
+    FileUtils.remove_entry(@dir, true)
   end
 
   def db(path = @path, site: 'e621')
@@ -78,6 +82,103 @@ class ArchiveDbTest < Minitest::Test
     store.record_sidecar(7, 3)
 
     assert_equal 1, store.file(7, 3)['sidecar']
+  end
+
+  # The file rows are read once and kept, because a full scan of the table
+  # costs a minute on a spinning disk and the startup pass needs it three
+  # times over. The cache must therefore follow every write.
+  def test_the_file_cache_follows_every_write
+    store = db
+    store.record_file(post_id: 7, path: 'posts/7.png', dir: 'posts', sidecar: false)
+    assert_equal 1, store.files.size
+
+    store.record_sidecar(7, nil)
+    assert_equal 1, store.files.first['sidecar'], 'a sidecar update is seen'
+
+    store.record_file(post_id: 8, path: 'posts/8.png', dir: 'posts')
+    assert_equal 2, store.files.size, 'a new file is seen'
+
+    store.forget_file(8)
+    assert_equal 1, store.files.size, 'a forgotten file is gone'
+  end
+
+  def test_the_file_cache_follows_a_layout_migration
+    store = db
+    store.record_file(post_id: 7, path: '7.png', dir: '.', md5: 'abc')
+
+    store.relocate_root_files('posts')
+
+    row = store.files.first
+    assert_equal 'posts', row['dir']
+    assert_equal 'posts/7.png', row['path']
+  end
+
+  # A sidecar is compared against the stored record, which needs the post's
+  # tags, sources and pools. Reading them one post at a time is three queries
+  # per post, so they are read in bulk -- and the bulk answer has to be the
+  # same answer.
+  def test_the_bulk_stored_detail_matches_the_one_at_a_time_reading
+    store = db
+    store.record_post(post_id: 1, rating: 's', ext: 'png',
+                      tags: { 'general' => %w[cat dog], 'artist' => %w[bob] },
+                      sources: ['https://x.test/1'])
+    store.record_post(post_id: 2, rating: 'e', ext: 'jpg', tags: { 'general' => %w[bird] })
+    store.record_pool_post(42, 1)
+
+    details = store.stored_details([1, 2])
+
+    assert_equal 2, details.size
+    assert_equal({ 'general' => %w[cat dog], 'artist' => %w[bob] }, details[1]['tags'])
+    assert_equal ['https://x.test/1'], details[1]['sources']
+    assert_equal [42], details[1]['pools']
+    assert_equal 's', details[1]['record']['rating']
+    assert_equal({ 'general' => %w[bird] }, details[2]['tags'])
+    assert_empty details[2]['sources']
+  end
+
+  # The sources end up in the sidecar in the order the site listed them, so a
+  # bulk read that reordered them would rewrite every sidecar, every run.
+  def test_the_bulk_stored_detail_keeps_the_order_of_the_sources
+    store = db
+    store.record_post(post_id: 1, rating: 's', tags: { 'general' => %w[cat] },
+                      sources: ['https://z.test/1', 'https://a.test/2', 'https://m.test/3'])
+
+    assert_equal store.sources(1), store.stored_details([1])[1]['sources']
+    assert_equal ['https://z.test/1', 'https://a.test/2', 'https://m.test/3'],
+                 store.stored_details([1])[1]['sources']
+  end
+
+  def test_the_bulk_stored_detail_leaves_unknown_posts_out
+    store = db
+    store.record_post(post_id: 1, rating: 's', tags: { 'general' => %w[cat] })
+
+    details = store.stored_details([1, 999])
+
+    assert_equal [1], details.keys
+  end
+
+  # A post carries dozens of tags, and a statement per tag is five million
+  # statements on a run that rediscovers every post. The rows go in as one
+  # multi-row insert, and the rows have to be the same rows.
+  def test_tags_are_stored_the_same_way_however_many_there_are
+    store = db
+    tags = { 'general' => (1..150).map { |i| "g#{i}" }, 'artist' => %w[bob] }
+
+    store.record_post(post_id: 1, tags: tags)
+
+    assert_equal 151, store.tag_count_for_post(1)
+    assert_equal 151, store.tag_count
+    stored = store.post_tags(1)
+    assert_equal tags['general'].sort, stored['general']
+    assert_equal tags['artist'], stored['artist']
+  end
+
+  def test_the_extension_of_every_post_is_readable_in_one_pass
+    store = db
+    store.record_post(post_id: 1, ext: 'png')
+    store.record_post(post_id: 2, ext: 'webm')
+
+    assert_equal({ 1 => 'png', 2 => 'webm' }, store.post_exts)
   end
 
   # A directory that the pool slug has never been recorded for is created,

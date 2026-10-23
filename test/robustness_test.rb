@@ -546,7 +546,6 @@ def test_a_download_fault_of_any_shape_is_reported_not_raised
   # over a large archive into an hours-long one, so a batch that will not read is
   # retried smaller first.
   def test_a_failed_sidecar_batch_is_retried_smaller
-    @archiver.instance_variable_set(:@sidecar_index, {})
     batch = Array.new(8) { |i| ["/sidecars/#{i}.xmp", "k#{i}"] }
     sizes = []
 
@@ -558,26 +557,28 @@ def test_a_download_fault_of_any_shape_is_reported_not_raised
         [JSON.generate(paths.map { |path| { 'SourceFile' => path } }), '', passing_status]
       end
     end
+    entries = nil
     with_capture3(responder) do
-      assert @archiver.index_sidecar_batch(batch), 'a smaller batch works, so the index is kept'
+      entries = @archiver.read_sidecar_batch(batch)
     end
 
+    assert entries, 'a smaller batch works, so the index is kept'
     assert_operator sizes.size, :>, 1, 'the batch was retried at a smaller size'
     assert_equal 8, sizes.first, 'it starts with the whole batch'
     assert_operator sizes.min, :<=, 2, 'and shrinks until it fits'
-    assert_equal 8, @archiver.instance_variable_get(:@sidecar_index).size,
+    assert_equal 8, entries.size,
                  'every sidecar still ends up indexed'
   end
 
   def test_a_sidecar_batch_that_cannot_be_read_at_all_is_reported
     batch = Array.new(8) { |i| ["/sidecars/#{i}.xmp", "k#{i}"] }
     with_capture3(->(_paths) { ['', 'boom', failing_status] }) do
-      refute @archiver.index_sidecar_batch(batch), 'the caller has to fall back to single reads'
+      refute @archiver.read_sidecar_batch(batch), 'the caller has to fall back to single reads'
     end
   end
 
   def test_an_empty_sidecar_batch_is_a_no_op
-    assert @archiver.index_sidecar_batch([])
+    assert_equal({}, @archiver.read_sidecar_batch([]))
   end
 
   # --- cache growth ---------------------------------------------------------

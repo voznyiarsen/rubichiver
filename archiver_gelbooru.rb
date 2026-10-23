@@ -457,7 +457,7 @@ class GelbooruArchiver < Archiver
     seconds && Time.at(seconds).utc.iso8601
   end
 
-  def build_stored_post(record, categories, sources)
+  def build_stored_post(record, categories, sources, _pools = nil)
     # Re-emitted as prefixed forms so categorize_tags lands every stored
     # category back where it was: a stored contributor tag as plain 'foo' would
     # otherwise fall through to general.
